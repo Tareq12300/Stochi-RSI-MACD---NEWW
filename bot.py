@@ -28,11 +28,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# ENV VARIABLES
+# ENV
 # ─────────────────────────────────────────────
 
 CMC_KEY = os.environ["CMC_API_KEY"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
+# ضع يوزر القناة أو ID القناة
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
@@ -181,53 +184,35 @@ def coin_card(c):
         f"📊 RSI: `{c['rsi']:.0f}` — {rsi_label(c['rsi'])}\n"
         f"📈 MACD: `{c['macd']:+.2f}`\n"
         f"💧 Volume: {fmt_num(c['vol'])}\n"
-        f"🔥 Volume Ratio: `{c['vol_ratio']:.2f}x` — {vol_label(c['vol_ratio'])}\n"
+        f"🔥 Volume Ratio: `{c['vol_ratio']:.2f}x`\n"
         f"🏦 Market Cap: {fmt_num(c['mcap'])}"
     )
 
 # ─────────────────────────────────────────────
-# START
+# STARTUP MESSAGE
 # ─────────────────────────────────────────────
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def send_startup_message(app):
 
-    text = (
-        "🚀 *أهلاً بك في بوت كريبتو سكانر برو* 📡\n\n"
+    if CHANNEL_ID:
 
-        "يقوم البوت بتحليل أكثر من *1000 عملة رقمية*\n"
-        "مباشرة من CoinMarketCap\n\n"
-
-        "━━━━━━━━━━━━━━━\n"
-        "✅ تحليل RSI\n"
-        "✅ تحليل MACD\n"
-        "✅ تحليل Volume\n"
-        "✅ تتبع Market Cap\n"
-        "━━━━━━━━━━━━━━━\n\n"
-
-        "📌 *الأوامر المتاحة:*\n\n"
-
-        "🔍 /scan\n"
-        "سكانر الفرص القوية\n\n"
-
-        "📉 /oversold\n"
-        "عملات في ذروة البيع\n\n"
-
-        "🔥 /volume\n"
-        "أعلى حجم تداول\n\n"
-
-        "🔎 /find BTC\n"
-        "البحث عن أي عملة\n\n"
-
-        "⚠️ البوت للتحليل فقط وليس نصيحة مالية"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.MARKDOWN
-    )
+        await app.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=(
+                "🚀 *تم تشغيل بوت كريبتو سكانر بنجاح*\n\n"
+                "✅ البوت متصل الآن ويعمل\n\n"
+                "📌 الأوامر:\n"
+                "🔍 /scan\n"
+                "📉 /oversold\n"
+                "🔥 /volume\n"
+                "🔎 /find BTC\n\n"
+                "⚡ جاهز لتحليل العملات"
+            ),
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 # ─────────────────────────────────────────────
-# SCAN
+# COMMANDS
 # ─────────────────────────────────────────────
 
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -254,14 +239,6 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             key=lambda x: x["vol_ratio"],
             reverse=True
         )[:10]
-
-        if not best:
-
-            best = sorted(
-                coins,
-                key=lambda x: x["vol_ratio"],
-                reverse=True
-            )[:10]
 
         now = datetime.now().strftime("%H:%M:%S")
 
@@ -291,10 +268,6 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
 
         await msg.edit_text(f"❌ خطأ: {e}")
-
-# ─────────────────────────────────────────────
-# OVERSOLD
-# ─────────────────────────────────────────────
 
 async def cmd_oversold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
@@ -334,10 +307,6 @@ async def cmd_oversold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await msg.edit_text(f"❌ خطأ: {e}")
 
-# ─────────────────────────────────────────────
-# VOLUME
-# ─────────────────────────────────────────────
-
 async def cmd_volume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text(
@@ -361,62 +330,6 @@ async def cmd_volume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += "\n\n━━━━━━━━━━━━━━━\n\n".join(
             coin_card(c)
             for c in top[:5]
-        )
-
-        await msg.edit_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    except Exception as e:
-
-        await msg.edit_text(f"❌ خطأ: {e}")
-
-# ─────────────────────────────────────────────
-# FIND
-# ─────────────────────────────────────────────
-
-async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-
-    if not ctx.args:
-
-        await update.message.reply_text(
-            "❓ مثال:\n/find BTC"
-        )
-
-        return
-
-    query = " ".join(ctx.args).lower()
-
-    msg = await update.message.reply_text(
-        f"🔎 جاري البحث عن {query.upper()}..."
-    )
-
-    try:
-
-        raw = await fetch_coins(1000)
-
-        coins = enrich(raw)
-
-        found = [
-            c for c in coins
-            if query in c["symbol"].lower()
-            or query in c["name"].lower()
-        ]
-
-        if not found:
-
-            await msg.edit_text(
-                "❌ لم يتم العثور على العملة"
-            )
-
-            return
-
-        text = f"🔎 *نتائج البحث*\n\n"
-
-        text += "\n\n━━━━━━━━━━━━━━━\n\n".join(
-            coin_card(c)
-            for c in found[:3]
         )
 
         await msg.edit_text(
@@ -457,15 +370,15 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("oversold", cmd_oversold))
     app.add_handler(CommandHandler("volume", cmd_volume))
-    app.add_handler(CommandHandler("find", cmd_find))
 
     app.add_handler(
         CallbackQueryHandler(handle_callback)
     )
+
+    app.post_init = send_startup_message
 
     logger.info("🚀 البوت شغّال!")
 
