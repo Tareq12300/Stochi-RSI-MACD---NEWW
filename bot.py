@@ -18,6 +18,8 @@ STOCH_MAX_K = float(os.getenv("STOCH_MAX_K", "50"))
 MIN_VOLUME_USDT = float(os.getenv("MIN_VOLUME_USDT", "50000"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 
+REQUIRE_MACD_POSITIVE = os.getenv("REQUIRE_MACD_POSITIVE", "false").lower() == "true"
+
 sent_alerts = set()
 
 def interval_map(exchange):
@@ -38,66 +40,121 @@ def safe_get(url, params=None):
 
 def get_pairs_gate():
     data = safe_get("https://api.gateio.ws/api/v4/spot/currency_pairs")
-    return [x["id"] for x in data if x.get("quote") == "USDT" and x.get("trade_status") == "tradable"]
+    return [
+        x["id"] for x in data
+        if x.get("quote") == "USDT"
+        and x.get("trade_status") == "tradable"
+    ]
 
 def get_pairs_mexc():
     data = safe_get("https://api.mexc.com/api/v3/exchangeInfo")
-    return [x["symbol"] for x in data.get("symbols", []) if x.get("quoteAsset") == "USDT" and x.get("status") == "ENABLED"]
+    return [
+        x["symbol"] for x in data.get("symbols", [])
+        if x.get("quoteAsset") == "USDT"
+        and x.get("status") == "ENABLED"
+    ]
 
 def get_pairs_okx():
-    data = safe_get("https://www.okx.com/api/v5/public/instruments", {"instType": "SPOT"})
-    return [x["instId"] for x in data.get("data", []) if x.get("quoteCcy") == "USDT" and x.get("state") == "live"]
+    data = safe_get(
+        "https://www.okx.com/api/v5/public/instruments",
+        {"instType": "SPOT"}
+    )
+    return [
+        x["instId"] for x in data.get("data", [])
+        if x.get("quoteCcy") == "USDT"
+        and x.get("state") == "live"
+    ]
 
 def get_pairs_bybit():
-    data = safe_get("https://api.bybit.com/v5/market/instruments-info", {"category": "spot", "limit": 1000})
-    return [x["symbol"] for x in data.get("result", {}).get("list", []) if x.get("quoteCoin") == "USDT" and x.get("status") == "Trading"]
+    data = safe_get(
+        "https://api.bybit.com/v5/market/instruments-info",
+        {"category": "spot", "limit": 1000}
+    )
+    return [
+        x["symbol"] for x in data.get("result", {}).get("list", [])
+        if x.get("quoteCoin") == "USDT"
+        and x.get("status") == "Trading"
+    ]
 
 def get_candles_gate(pair):
-    data = safe_get("https://api.gateio.ws/api/v4/spot/candlesticks", {
-        "currency_pair": pair,
-        "interval": interval_map("gate"),
-        "limit": 100
-    })
+    data = safe_get(
+        "https://api.gateio.ws/api/v4/spot/candlesticks",
+        {
+            "currency_pair": pair,
+            "interval": interval_map("gate"),
+            "limit": 100
+        }
+    )
 
     candles = []
+
     for c in data:
         close = float(c[2])
         base_vol = float(c[1])
-        candles.append({"close": close, "volume": base_vol * close})
+        candles.append({
+            "close": close,
+            "volume": base_vol * close
+        })
+
     return candles
 
 def get_candles_mexc(pair):
-    data = safe_get("https://api.mexc.com/api/v3/klines", {
-        "symbol": pair,
-        "interval": interval_map("mexc"),
-        "limit": 100
-    })
+    data = safe_get(
+        "https://api.mexc.com/api/v3/klines",
+        {
+            "symbol": pair,
+            "interval": interval_map("mexc"),
+            "limit": 100
+        }
+    )
 
-    return [{"close": float(c[4]), "volume": float(c[7])} for c in data]
+    return [
+        {
+            "close": float(c[4]),
+            "volume": float(c[7])
+        }
+        for c in data
+    ]
 
 def get_candles_okx(pair):
-    data = safe_get("https://www.okx.com/api/v5/market/candles", {
-        "instId": pair,
-        "bar": interval_map("okx"),
-        "limit": 100
-    })
+    data = safe_get(
+        "https://www.okx.com/api/v5/market/candles",
+        {
+            "instId": pair,
+            "bar": interval_map("okx"),
+            "limit": 100
+        }
+    )
 
     candles = []
+
     for c in data.get("data", []):
-        candles.append({"close": float(c[4]), "volume": float(c[7])})
+        candles.append({
+            "close": float(c[4]),
+            "volume": float(c[7])
+        })
+
     return list(reversed(candles))
 
 def get_candles_bybit(pair):
-    data = safe_get("https://api.bybit.com/v5/market/kline", {
-        "category": "spot",
-        "symbol": pair,
-        "interval": interval_map("bybit"),
-        "limit": 100
-    })
+    data = safe_get(
+        "https://api.bybit.com/v5/market/kline",
+        {
+            "category": "spot",
+            "symbol": pair,
+            "interval": interval_map("bybit"),
+            "limit": 100
+        }
+    )
 
     candles = []
+
     for c in data.get("result", {}).get("list", []):
-        candles.append({"close": float(c[4]), "volume": float(c[6])})
+        candles.append({
+            "close": float(c[4]),
+            "volume": float(c[6])
+        })
+
     return list(reversed(candles))
 
 def rsi(values, period=14):
@@ -177,10 +234,12 @@ def macd_histogram(closes):
     macd_line = ema12 - ema26
 
     macd_values = []
+
     for i in range(26, len(closes)):
         part = closes[:i + 1]
         e12 = ema(part, 12)
         e26 = ema(part, 26)
+
         if e12 is not None and e26 is not None:
             macd_values.append(e12 - e26)
 
@@ -205,7 +264,8 @@ def build_alert(exchange, pair, price, k, d, macd_hist, volume, confidence):
         f"🎯 الثقة: *{confidence}%*\n\n"
         f"✅ K أعلى من D\n"
         f"✅ Stoch RSI أقل من {STOCH_MAX_K}\n"
-        f"✅ Volume قوي\n\n"
+        f"✅ Volume قوي\n"
+        f"{'✅ MACD إيجابي' if macd_hist > 0 else '⚠️ MACD سلبي'}\n\n"
         f"⚠️ تحليل فقط وليس نصيحة مالية"
     )
 
@@ -250,10 +310,13 @@ async def scanner(app):
                         macd_hist = macd_histogram(closes)
 
                         confidence = 0
+
                         if k > d:
                             confidence += 40
+
                         if k <= STOCH_MAX_K:
                             confidence += 30
+
                         if volume >= MIN_VOLUME_USDT:
                             confidence += 30
 
@@ -262,6 +325,7 @@ async def scanner(app):
                             and k <= STOCH_MAX_K
                             and volume >= MIN_VOLUME_USDT
                             and confidence >= MIN_CONFIDENCE
+                            and (not REQUIRE_MACD_POSITIVE or macd_hist > 0)
                         ):
                             key = f"{exchange}_{pair}_{int(time.time() // 14400)}"
 
