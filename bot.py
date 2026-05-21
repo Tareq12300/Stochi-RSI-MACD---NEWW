@@ -18,224 +18,89 @@ STOCH_MAX_K = float(os.getenv("STOCH_MAX_K", "50"))
 MIN_VOLUME_USDT = float(os.getenv("MIN_VOLUME_USDT", "50000"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 
-EXCHANGES = ["gate", "mexc", "okx", "bybit"]
-
 sent_alerts = set()
 
-# ─────────────────────────────────────────────
-# INTERVAL MAP
-# ─────────────────────────────────────────────
-
 def interval_map(exchange):
-
     if exchange == "gate":
         return "4h"
-
     if exchange == "mexc":
         return "4h"
-
     if exchange == "okx":
         return "4H"
-
     if exchange == "bybit":
         return "240"
-
     return "4h"
 
-# ─────────────────────────────────────────────
-# REQUEST
-# ─────────────────────────────────────────────
-
 def safe_get(url, params=None):
-
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-
     return r.json()
 
-# ─────────────────────────────────────────────
-# PAIRS
-# ─────────────────────────────────────────────
-
 def get_pairs_gate():
-
-    data = safe_get(
-        "https://api.gateio.ws/api/v4/spot/currency_pairs"
-    )
-
-    pairs = []
-
-    for x in data:
-
-        if (
-            x.get("quote") == "USDT"
-            and x.get("trade_status") == "tradable"
-        ):
-            pairs.append(x["id"])
-
-    return pairs
+    data = safe_get("https://api.gateio.ws/api/v4/spot/currency_pairs")
+    return [x["id"] for x in data if x.get("quote") == "USDT" and x.get("trade_status") == "tradable"]
 
 def get_pairs_mexc():
-
-    data = safe_get(
-        "https://api.mexc.com/api/v3/exchangeInfo"
-    )
-
-    pairs = []
-
-    for x in data.get("symbols", []):
-
-        if (
-            x.get("quoteAsset") == "USDT"
-            and x.get("status") == "ENABLED"
-        ):
-            pairs.append(x["symbol"])
-
-    return pairs
+    data = safe_get("https://api.mexc.com/api/v3/exchangeInfo")
+    return [x["symbol"] for x in data.get("symbols", []) if x.get("quoteAsset") == "USDT" and x.get("status") == "ENABLED"]
 
 def get_pairs_okx():
-
-    data = safe_get(
-        "https://www.okx.com/api/v5/public/instruments",
-        {"instType": "SPOT"}
-    )
-
-    pairs = []
-
-    for x in data.get("data", []):
-
-        if (
-            x.get("quoteCcy") == "USDT"
-            and x.get("state") == "live"
-        ):
-            pairs.append(x["instId"])
-
-    return pairs
+    data = safe_get("https://www.okx.com/api/v5/public/instruments", {"instType": "SPOT"})
+    return [x["instId"] for x in data.get("data", []) if x.get("quoteCcy") == "USDT" and x.get("state") == "live"]
 
 def get_pairs_bybit():
-
-    data = safe_get(
-        "https://api.bybit.com/v5/market/instruments-info",
-        {
-            "category": "spot",
-            "limit": 1000
-        }
-    )
-
-    pairs = []
-
-    for x in data.get("result", {}).get("list", []):
-
-        if (
-            x.get("quoteCoin") == "USDT"
-            and x.get("status") == "Trading"
-        ):
-            pairs.append(x["symbol"])
-
-    return pairs
-
-# ─────────────────────────────────────────────
-# CANDLES
-# ─────────────────────────────────────────────
+    data = safe_get("https://api.bybit.com/v5/market/instruments-info", {"category": "spot", "limit": 1000})
+    return [x["symbol"] for x in data.get("result", {}).get("list", []) if x.get("quoteCoin") == "USDT" and x.get("status") == "Trading"]
 
 def get_candles_gate(pair):
-
-    data = safe_get(
-        "https://api.gateio.ws/api/v4/spot/candlesticks",
-        {
-            "currency_pair": pair,
-            "interval": interval_map("gate"),
-            "limit": 100
-        }
-    )
+    data = safe_get("https://api.gateio.ws/api/v4/spot/candlesticks", {
+        "currency_pair": pair,
+        "interval": interval_map("gate"),
+        "limit": 100
+    })
 
     candles = []
-
     for c in data:
-
         close = float(c[2])
         base_vol = float(c[1])
-
-        candles.append({
-            "close": close,
-            "volume": base_vol * close
-        })
-
+        candles.append({"close": close, "volume": base_vol * close})
     return candles
 
 def get_candles_mexc(pair):
+    data = safe_get("https://api.mexc.com/api/v3/klines", {
+        "symbol": pair,
+        "interval": interval_map("mexc"),
+        "limit": 100
+    })
 
-    data = safe_get(
-        "https://api.mexc.com/api/v3/klines",
-        {
-            "symbol": pair,
-            "interval": interval_map("mexc"),
-            "limit": 100
-        }
-    )
-
-    candles = []
-
-    for c in data:
-
-        candles.append({
-            "close": float(c[4]),
-            "volume": float(c[7])
-        })
-
-    return candles
+    return [{"close": float(c[4]), "volume": float(c[7])} for c in data]
 
 def get_candles_okx(pair):
-
-    data = safe_get(
-        "https://www.okx.com/api/v5/market/candles",
-        {
-            "instId": pair,
-            "bar": interval_map("okx"),
-            "limit": 100
-        }
-    )
+    data = safe_get("https://www.okx.com/api/v5/market/candles", {
+        "instId": pair,
+        "bar": interval_map("okx"),
+        "limit": 100
+    })
 
     candles = []
-
     for c in data.get("data", []):
-
-        candles.append({
-            "close": float(c[4]),
-            "volume": float(c[7])
-        })
-
-    return candles
+        candles.append({"close": float(c[4]), "volume": float(c[7])})
+    return list(reversed(candles))
 
 def get_candles_bybit(pair):
-
-    data = safe_get(
-        "https://api.bybit.com/v5/market/kline",
-        {
-            "category": "spot",
-            "symbol": pair,
-            "interval": interval_map("bybit"),
-            "limit": 100
-        }
-    )
+    data = safe_get("https://api.bybit.com/v5/market/kline", {
+        "category": "spot",
+        "symbol": pair,
+        "interval": interval_map("bybit"),
+        "limit": 100
+    })
 
     candles = []
-
     for c in data.get("result", {}).get("list", []):
-
-        candles.append({
-            "close": float(c[4]),
-            "volume": float(c[6])
-        })
-
-    return candles
-
-# ─────────────────────────────────────────────
-# RSI
-# ─────────────────────────────────────────────
+        candles.append({"close": float(c[4]), "volume": float(c[6])})
+    return list(reversed(candles))
 
 def rsi(values, period=14):
-
     if len(values) < period + 1:
         return []
 
@@ -243,9 +108,7 @@ def rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
-
         diff = values[i] - values[i - 1]
-
         gains.append(max(diff, 0))
         losses.append(abs(min(diff, 0)))
 
@@ -255,7 +118,6 @@ def rsi(values, period=14):
     rsis = []
 
     for i in range(period, len(gains)):
-
         avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
         avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
 
@@ -267,12 +129,7 @@ def rsi(values, period=14):
 
     return rsis
 
-# ─────────────────────────────────────────────
-# STOCH RSI
-# ─────────────────────────────────────────────
-
 def stoch_rsi(closes):
-
     rsi_values = rsi(closes)
 
     if len(rsi_values) < 20:
@@ -285,90 +142,118 @@ def stoch_rsi(closes):
         return None
 
     current = rsi_values[-1]
-
     k = ((current - lowest) / (highest - lowest)) * 100
 
-    d = sum([
-        ((x - lowest) / (highest - lowest)) * 100
-        for x in rsi_values[-3:]
-    ]) / 3
+    d_values = []
+    for x in rsi_values[-3:]:
+        d_values.append(((x - lowest) / (highest - lowest)) * 100)
+
+    d = sum(d_values) / len(d_values)
 
     return k, d
 
-# ─────────────────────────────────────────────
-# ALERT
-# ─────────────────────────────────────────────
+def ema(values, period):
+    if len(values) < period:
+        return None
 
-def build_alert(exchange, pair, price, k, d, volume):
+    multiplier = 2 / (period + 1)
+    ema_value = sum(values[:period]) / period
 
+    for price in values[period:]:
+        ema_value = (price - ema_value) * multiplier + ema_value
+
+    return ema_value
+
+def macd_histogram(closes):
+    if len(closes) < 35:
+        return 0
+
+    ema12 = ema(closes, 12)
+    ema26 = ema(closes, 26)
+
+    if ema12 is None or ema26 is None:
+        return 0
+
+    macd_line = ema12 - ema26
+
+    macd_values = []
+    for i in range(26, len(closes)):
+        part = closes[:i + 1]
+        e12 = ema(part, 12)
+        e26 = ema(part, 26)
+        if e12 is not None and e26 is not None:
+            macd_values.append(e12 - e26)
+
+    signal = ema(macd_values, 9)
+
+    if signal is None:
+        return 0
+
+    return macd_line - signal
+
+def build_alert(exchange, pair, price, k, d, macd_hist, volume, confidence):
     return (
         f"🟢 *Stoch RSI Alert*\n\n"
         f"🏦 المنصة: *{exchange.upper()}*\n"
         f"🪙 العملة: *{pair}*\n"
         f"💰 السعر: `{price}`\n\n"
-        f"📊 K: `{k:.2f}`\n"
-        f"📊 D: `{d:.2f}`\n\n"
-        f"💧 Volume: `${volume:,.0f}`\n\n"
+        f"📊 Stoch RSI K: `{k:.2f}`\n"
+        f"📊 Stoch RSI D: `{d:.2f}`\n"
+        f"📈 MACD Histogram: `{macd_hist:.6f}`\n\n"
+        f"💧 Volume: `${volume:,.0f}`\n"
+        f"⏰ الفريم: *4H*\n"
+        f"🎯 الثقة: *{confidence}%*\n\n"
+        f"✅ K أعلى من D\n"
+        f"✅ Stoch RSI أقل من {STOCH_MAX_K}\n"
+        f"✅ Volume قوي\n\n"
         f"⚠️ تحليل فقط وليس نصيحة مالية"
     )
 
-# ─────────────────────────────────────────────
-# SCANNER
-# ─────────────────────────────────────────────
-
 async def scanner(app):
-
     await asyncio.sleep(5)
 
+    exchanges = {
+        "gate": (get_pairs_gate, get_candles_gate),
+        "mexc": (get_pairs_mexc, get_candles_mexc),
+        "okx": (get_pairs_okx, get_candles_okx),
+        "bybit": (get_pairs_bybit, get_candles_bybit),
+    }
+
     while True:
-
         try:
-
-            logger.info("🔍 Scanning...")
-
-            exchanges = {
-                "gate": (get_pairs_gate, get_candles_gate),
-                "mexc": (get_pairs_mexc, get_candles_mexc),
-                "okx": (get_pairs_okx, get_candles_okx),
-                "bybit": (get_pairs_bybit, get_candles_bybit),
-            }
+            logger.info("🔍 Scanning 4H Stoch RSI...")
 
             for exchange, funcs in exchanges.items():
-
                 get_pairs, get_candles = funcs
-
                 pairs = get_pairs()
 
                 logger.info(f"{exchange}: {len(pairs)} pairs")
 
-                for pair in pairs[:300]:
-
+                for pair in pairs:
                     try:
-
                         candles = get_candles(pair)
 
-                        closes = [x["close"] for x in candles]
+                        if len(candles) < 50:
+                            continue
 
+                        closes = [x["close"] for x in candles]
                         result = stoch_rsi(closes)
 
                         if not result:
                             continue
 
                         k, d = result
-
                         last = candles[-1]
 
-                        volume = last["volume"]
                         price = last["close"]
+                        volume = last["volume"]
+                        macd_hist = macd_histogram(closes)
 
                         confidence = 0
-
                         if k > d:
                             confidence += 40
-
                         if k <= STOCH_MAX_K:
                             confidence += 30
-
                         if volume >= MIN_VOLUME_USDT:
                             confidence += 30
 
@@ -378,8 +263,7 @@ async def scanner(app):
                             and volume >= MIN_VOLUME_USDT
                             and confidence >= MIN_CONFIDENCE
                         ):
-
-                            key = f"{exchange}_{pair}"
+                            key = f"{exchange}_{pair}_{int(time.time() // 14400)}"
 
                             if key in sent_alerts:
                                 continue
@@ -394,7 +278,9 @@ async def scanner(app):
                                     price,
                                     k,
                                     d,
-                                    volume
+                                    macd_hist,
+                                    volume,
+                                    confidence
                                 ),
                                 parse_mode=ParseMode.MARKDOWN
                             )
@@ -409,12 +295,7 @@ async def scanner(app):
 
         await asyncio.sleep(CHECK_INTERVAL)
 
-# ─────────────────────────────────────────────
-# STARTUP
-# ─────────────────────────────────────────────
-
 async def startup(app):
-
     await app.bot.send_message(
         chat_id=CHANNEL_ID,
         text="🚀 البوت شغّال — Stoch RSI 4H"
@@ -422,18 +303,10 @@ async def startup(app):
 
     asyncio.create_task(scanner(app))
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
 def main():
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.post_init = startup
-
     logger.info("🚀 البوت شغّال!")
-
     app.run_polling()
 
 if __name__ == "__main__":
