@@ -1,19 +1,24 @@
 import os
 import logging
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+import httpx
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
 )
-from telegram.constants import ParseMode
-import httpx
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Logging
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,20 +27,21 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # ENV
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 CMC_KEY = os.environ["CMC_API_KEY"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Fetch Coins
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 async def fetch_coins(limit=1000, start=1):
+
     params = {
         "limit": limit,
         "start": start,
@@ -49,6 +55,7 @@ async def fetch_coins(limit=1000, start=1):
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
+
         response = await client.get(
             CMC_URL,
             params=params,
@@ -59,11 +66,12 @@ async def fetch_coins(limit=1000, start=1):
 
         return response.json()["data"]
 
-# ─────────────────────────────────────────────────────────────
-# Enrich Data
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Analysis
+# ─────────────────────────────────────────────
 
 def enrich(coins):
+
     result = []
 
     for c in coins:
@@ -78,19 +86,18 @@ def enrich(coins):
         mcap = q.get("market_cap") or 1
         price = q.get("price") or 0
 
-        # Fake RSI approximation
+        # RSI approximation
         rsi_raw = 50 + (h24 * 2) + (d7 * 0.5)
         rsi = max(5, min(95, rsi_raw))
 
-        # Fake MACD approximation
+        # MACD approximation
         macd = h24 - (d7 / 7)
 
-        # Volume Ratio
+        # Volume ratio
         vol_ratio = (vol / mcap) * 10 if mcap else 0
 
         result.append({
             "rank": c.get("cmc_rank", 0),
-            "id": c.get("id"),
             "name": c.get("name"),
             "symbol": c.get("symbol"),
             "price": price,
@@ -106,9 +113,9 @@ def enrich(coins):
 
     return result
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def fmt_price(p):
 
@@ -159,50 +166,45 @@ def vol_label(v):
         return "🚀 ضخم جداً"
 
     if v > 2:
-        return "🔥 مرتفع كبير"
+        return "🔥 مرتفع"
 
     if v > 1.5:
-        return "📈 مرتفع"
-
-    if v < 0.3:
-        return "📉 منخفض جداً"
+        return "📈 جيد"
 
     return "⚪ طبيعي"
 
-def coin_card(c, show_rank=True):
+def coin_card(c):
 
-    rank = f"#{c['rank']} " if show_rank else ""
+    return (
+        f"*#{c['rank']} {c['name']} ({c['symbol']})*\n"
+        f"💰 السعر: `{fmt_price(c['price'])}`\n"
+        f"⏱ 1H: {pct(c['h1'])}\n"
+        f"📅 24H: {pct(c['h24'])}\n"
+        f"📆 7D: {pct(c['d7'])}\n"
+        f"📊 RSI: `{c['rsi']:.0f}` — {rsi_label(c['rsi'])}\n"
+        f"📈 MACD: `{c['macd']:+.2f}`\n"
+        f"💧 Volume: {fmt_num(c['vol'])}\n"
+        f"🔥 Volume Ratio: `{c['vol_ratio']:.2f}x` — {vol_label(c['vol_ratio'])}\n"
+        f"🏦 Market Cap: {fmt_num(c['mcap'])}"
+    )
 
-    lines = [
-        f"*{rank}{c['name']} ({c['symbol']})*",
-        f"💰 السعر: `{fmt_price(c['price'])}`",
-        f"⏱ 1 ساعة: {pct(c['h1'])}",
-        f"📅 24 ساعة: {pct(c['h24'])}",
-        f"📆 7 أيام: {pct(c['d7'])}",
-        f"📊 RSI: `{c['rsi']:.0f}` — {rsi_label(c['rsi'])}",
-        f"📈 MACD: `{c['macd']:+.2f}`",
-        f"💧 حجم 24h: {fmt_num(c['vol'])}",
-        f"🔥 Volume Ratio: `{c['vol_ratio']:.2f}x` — {vol_label(c['vol_ratio'])}",
-        f"🏦 Market Cap: {fmt_num(c['mcap'])}",
-    ]
-
-    return "\n".join(lines)
-
-# ─────────────────────────────────────────────────────────────
-# Welcome Message
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# START
+# ─────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = (
-        "🚀 *مرحباً بك في بوت كريبتو سكانر برو* 📡\n\n"
+        "🚀 *أهلاً بك في بوت كريبتو سكانر برو* 📡\n\n"
+
         "يقوم البوت بتحليل أكثر من *1000 عملة رقمية*\n"
         "مباشرة من CoinMarketCap\n\n"
+
         "━━━━━━━━━━━━━━━\n"
-        "✅ RSI Analysis\n"
-        "✅ MACD Analysis\n"
-        "✅ Volume Analysis\n"
-        "✅ Market Cap Tracking\n"
+        "✅ تحليل RSI\n"
+        "✅ تحليل MACD\n"
+        "✅ تحليل Volume\n"
+        "✅ تتبع Market Cap\n"
         "━━━━━━━━━━━━━━━\n\n"
 
         "📌 *الأوامر المتاحة:*\n\n"
@@ -241,24 +243,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ─────────────────────────────────────────────────────────────
-# Help
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# HELP
+# ─────────────────────────────────────────────
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = (
         "📚 *شرح المؤشرات*\n\n"
 
-        "*RSI:*\n"
+        "📊 RSI:\n"
         "• أقل من 30 → ذروة بيع\n"
         "• أعلى من 70 → ذروة شراء\n\n"
 
-        "*MACD:*\n"
+        "📈 MACD:\n"
         "• موجب → زخم صاعد\n"
         "• سالب → زخم هابط\n\n"
 
-        "*Volume Ratio:*\n"
+        "🔥 Volume Ratio:\n"
         "• x3+ → ضخم جداً\n"
         "• x2+ → مرتفع\n"
         "• x1+ → جيد\n\n"
@@ -271,9 +273,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ─────────────────────────────────────────────────────────────
-# Scan
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SCAN
+# ─────────────────────────────────────────────
 
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
@@ -296,14 +298,15 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         best = sorted(
             best,
-            key=lambda c: c["vol_ratio"],
+            key=lambda x: x["vol_ratio"],
             reverse=True
         )[:10]
 
         if not best:
+
             best = sorted(
                 coins,
-                key=lambda c: c["vol_ratio"],
+                key=lambda x: x["vol_ratio"],
                 reverse=True
             )[:10]
 
@@ -336,14 +339,14 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await msg.edit_text(f"❌ خطأ: {e}")
 
-# ─────────────────────────────────────────────────────────────
-# Top Volume
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# OVERSOLD
+# ─────────────────────────────────────────────
 
-async def cmd_volume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_oversold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text(
-        "⏳ جاري البحث عن أعلى الأحجام..."
+        "⏳ جاري البحث عن ذروة البيع..."
     )
 
     try:
@@ -352,67 +355,29 @@ async def cmd_volume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         coins = enrich(raw)
 
-        top_vol = sorted(
-            coins,
-            key=lambda c: c["vol_ratio"],
-            reverse=True
+        oversold = [
+            c for c in coins
+            if c["rsi"] < 30
+        ]
+
+        oversold = sorted(
+            oversold,
+            key=lambda x: x["rsi"]
         )[:10]
 
-        now = datetime.now().strftime("%H:%M:%S")
+        if not oversold:
 
-        text = f"🔥 *أعلى حجم تداول — {now}*\n\n"
-
-        text += "\n\n━━━━━━━━━━━━━━━\n\n".join(
-            coin_card(c)
-            for c in top_vol[:5]
-        )
-
-        keyboard = [[
-            InlineKeyboardButton(
-                "🔄 تحديث",
-                callback_data="volume"
+            await msg.edit_text(
+                "❌ لا توجد عملات في ذروة البيع حالياً"
             )
-        ]]
 
-        await msg.edit_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+            return
 
-    except Exception as e:
-
-        await msg.edit_text(f"❌ خطأ: {e}")
-
-# ─────────────────────────────────────────────────────────────
-# Gainers
-# ─────────────────────────────────────────────────────────────
-
-async def cmd_gainers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-
-    msg = await update.message.reply_text(
-        "⏳ جاري جلب أعلى العملات ارتفاعاً..."
-    )
-
-    try:
-
-        raw = await fetch_coins(1000)
-
-        coins = enrich(raw)
-
-        gainers = sorted(
-            coins,
-            key=lambda c: c["h24"],
-            reverse=True
-        )[:10]
-
-        now = datetime.now().strftime("%H:%M:%S")
-
-        text = f"🚀 *أعلى ارتفاع 24 ساعة — {now}*\n\n"
+        text = "📉 *ذروة البيع*\n\n"
 
         text += "\n\n━━━━━━━━━━━━━━━\n\n".join(
             coin_card(c)
-            for c in gainers[:5]
+            for c in oversold[:5]
         )
 
         await msg.edit_text(
@@ -424,9 +389,47 @@ async def cmd_gainers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await msg.edit_text(f"❌ خطأ: {e}")
 
-# ─────────────────────────────────────────────────────────────
-# Find Coin
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# VOLUME
+# ─────────────────────────────────────────────
+
+async def cmd_volume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+    msg = await update.message.reply_text(
+        "⏳ جاري تحليل الأحجام..."
+    )
+
+    try:
+
+        raw = await fetch_coins(1000)
+
+        coins = enrich(raw)
+
+        top = sorted(
+            coins,
+            key=lambda x: x["vol_ratio"],
+            reverse=True
+        )[:10]
+
+        text = "🔥 *أعلى حجم تداول*\n\n"
+
+        text += "\n\n━━━━━━━━━━━━━━━\n\n".join(
+            coin_card(c)
+            for c in top[:5]
+        )
+
+        await msg.edit_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    except Exception as e:
+
+        await msg.edit_text(f"❌ خطأ: {e}")
+
+# ─────────────────────────────────────────────
+# FIND
+# ─────────────────────────────────────────────
 
 async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
@@ -441,7 +444,7 @@ async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = " ".join(ctx.args).lower()
 
     msg = await update.message.reply_text(
-        f"🔎 جاري البحث عن: {query.upper()}..."
+        f"🔎 جاري البحث عن {query.upper()}..."
     )
 
     try:
@@ -459,12 +462,12 @@ async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not found:
 
             await msg.edit_text(
-                f"❌ لم يتم العثور على '{query}'"
+                "❌ لم يتم العثور على العملة"
             )
 
             return
 
-        text = f"🔎 *نتائج البحث — {query.upper()}*\n\n"
+        text = f"🔎 *نتائج البحث*\n\n"
 
         text += "\n\n━━━━━━━━━━━━━━━\n\n".join(
             coin_card(c)
@@ -480,13 +483,12 @@ async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await msg.edit_text(f"❌ خطأ: {e}")
 
-# ─────────────────────────────────────────────────────────────
-# Callback Buttons
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# CALLBACK
+# ─────────────────────────────────────────────
 
 CALLBACK_MAP = {
     "scan": cmd_scan,
-    "volume": cmd_volume,
 }
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -502,9 +504,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if handler:
         await handler(update, ctx)
 
-# ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
 
 def main():
 
@@ -513,8 +515,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("oversold", cmd_oversold))
     app.add_handler(CommandHandler("volume", cmd_volume))
-    app.add_handler(CommandHandler("gainers", cmd_gainers))
     app.add_handler(CommandHandler("find", cmd_find))
 
     app.add_handler(
@@ -523,9 +525,7 @@ def main():
 
     logger.info("🚀 البوت شغّال!")
 
-    app.run_polling(
-        drop_pending_updates=True
-    )
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
