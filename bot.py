@@ -14,13 +14,20 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
-STOCH_MAX_K = float(os.getenv("STOCH_MAX_K", "50"))
+STOCH_MAX_K = float(os.getenv("STOCH_MAX_K", "30"))
 MIN_VOLUME_USDT = float(os.getenv("MIN_VOLUME_USDT", "50000"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.2"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 
 REQUIRE_MACD_POSITIVE = os.getenv("REQUIRE_MACD_POSITIVE", "false").lower() == "true"
 
+EXCLUDE_KEYWORDS = os.getenv(
+    "EXCLUDE_KEYWORDS",
+    "USDC,USDT,FDUSD,TUSD,USDE,DAI,BUSD,USDP,USDD,BABAON,NVDAX,UP,DOWN,3L,3S,BULL,BEAR"
+).split(",")
+
 sent_alerts = set()
+
 
 def interval_map(exchange):
     if exchange == "gate":
@@ -33,10 +40,23 @@ def interval_map(exchange):
         return "240"
     return "4h"
 
+
 def safe_get(url, params=None):
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
+
+
+def should_skip_pair(pair):
+    pair_upper = pair.upper()
+
+    for keyword in EXCLUDE_KEYWORDS:
+        keyword = keyword.strip().upper()
+        if keyword and keyword in pair_upper:
+            return True
+
+    return False
+
 
 def get_pairs_gate():
     data = safe_get("https://api.gateio.ws/api/v4/spot/currency_pairs")
@@ -44,7 +64,9 @@ def get_pairs_gate():
         x["id"] for x in data
         if x.get("quote") == "USDT"
         and x.get("trade_status") == "tradable"
+        and not should_skip_pair(x["id"])
     ]
+
 
 def get_pairs_mexc():
     data = safe_get("https://api.mexc.com/api/v3/exchangeInfo")
@@ -52,7 +74,9 @@ def get_pairs_mexc():
         x["symbol"] for x in data.get("symbols", [])
         if x.get("quoteAsset") == "USDT"
         and x.get("status") == "ENABLED"
+        and not should_skip_pair(x["symbol"])
     ]
+
 
 def get_pairs_okx():
     data = safe_get(
@@ -63,7 +87,9 @@ def get_pairs_okx():
         x["instId"] for x in data.get("data", [])
         if x.get("quoteCcy") == "USDT"
         and x.get("state") == "live"
+        and not should_skip_pair(x["instId"])
     ]
+
 
 def get_pairs_bybit():
     data = safe_get(
@@ -74,7 +100,9 @@ def get_pairs_bybit():
         x["symbol"] for x in data.get("result", {}).get("list", [])
         if x.get("quoteCoin") == "USDT"
         and x.get("status") == "Trading"
+        and not should_skip_pair(x["symbol"])
     ]
+
 
 def get_candles_gate(pair):
     data = safe_get(
@@ -98,6 +126,7 @@ def get_candles_gate(pair):
 
     return candles
 
+
 def get_candles_mexc(pair):
     data = safe_get(
         "https://api.mexc.com/api/v3/klines",
@@ -115,6 +144,7 @@ def get_candles_mexc(pair):
         }
         for c in data
     ]
+
 
 def get_candles_okx(pair):
     data = safe_get(
@@ -136,6 +166,7 @@ def get_candles_okx(pair):
 
     return list(reversed(candles))
 
+
 def get_candles_bybit(pair):
     data = safe_get(
         "https://api.bybit.com/v5/market/kline",
@@ -156,6 +187,7 @@ def get_candles_bybit(pair):
         })
 
     return list(reversed(candles))
+
 
 def rsi(values, period=14):
     if len(values) < period + 1:
@@ -186,6 +218,7 @@ def rsi(values, period=14):
 
     return rsis
 
+
 def stoch_rsi(closes):
     rsi_values = rsi(closes)
 
@@ -209,6 +242,7 @@ def stoch_rsi(closes):
 
     return k, d
 
+
 def ema(values, period):
     if len(values) < period:
         return None
@@ -220,6 +254,7 @@ def ema(values, period):
         ema_value = (price - ema_value) * multiplier + ema_value
 
     return ema_value
+
 
 def macd_histogram(closes):
     if len(closes) < 35:
@@ -250,7 +285,21 @@ def macd_histogram(closes):
 
     return macd_line - signal
 
-def build_alert(exchange, pair, price, k, d, macd_hist, volume, confidence):
+
+def volume_ratio(candles):
+    if len(candles) < 21:
+        return 0
+
+    current_volume = candles[-1]["volume"]
+    avg_volume = sum(x["volume"] for x in candles[-20:-1]) / 19
+
+    if avg_volume <= 0:
+        return 0
+
+    return current_volume / avg_volume
+
+
+def build_alert(exchange, pair, price, k, d, macd_hist, volume, vol_ratio, confidence):
     return (
         f"🟢 *Stoch RSI Alert*\n\n"
         f"🏦 المنصة: *{exchange.upper()}*\n"
@@ -260,14 +309,17 @@ def build_alert(exchange, pair, price, k, d, macd_hist, volume, confidence):
         f"📊 Stoch RSI D: `{d:.2f}`\n"
         f"📈 MACD Histogram: `{macd_hist:.6f}`\n\n"
         f"💧 Volume: `${volume:,.0f}`\n"
+        f"🔥 Volume Ratio: `{vol_ratio:.2f}X`\n"
         f"⏰ الفريم: *4H*\n"
         f"🎯 الثقة: *{confidence}%*\n\n"
         f"✅ K أعلى من D\n"
         f"✅ Stoch RSI أقل من {STOCH_MAX_K}\n"
         f"✅ Volume قوي\n"
+        f"✅ Volume Ratio أعلى من {MIN_VOLUME_RATIO}X\n"
         f"{'✅ MACD إيجابي' if macd_hist > 0 else '⚠️ MACD سلبي'}\n\n"
         f"⚠️ تحليل فقط وليس نصيحة مالية"
     )
+
 
 async def scanner(app):
     await asyncio.sleep(5)
@@ -307,23 +359,28 @@ async def scanner(app):
 
                         price = last["close"]
                         volume = last["volume"]
+                        vol_ratio = volume_ratio(candles)
                         macd_hist = macd_histogram(closes)
 
                         confidence = 0
 
                         if k > d:
-                            confidence += 40
+                            confidence += 35
 
                         if k <= STOCH_MAX_K:
-                            confidence += 30
+                            confidence += 25
 
                         if volume >= MIN_VOLUME_USDT:
-                            confidence += 30
+                            confidence += 20
+
+                        if vol_ratio >= MIN_VOLUME_RATIO:
+                            confidence += 20
 
                         if (
                             k > d
                             and k <= STOCH_MAX_K
                             and volume >= MIN_VOLUME_USDT
+                            and vol_ratio >= MIN_VOLUME_RATIO
                             and confidence >= MIN_CONFIDENCE
                             and (not REQUIRE_MACD_POSITIVE or macd_hist > 0)
                         ):
@@ -344,6 +401,7 @@ async def scanner(app):
                                     d,
                                     macd_hist,
                                     volume,
+                                    vol_ratio,
                                     confidence
                                 ),
                                 parse_mode=ParseMode.MARKDOWN
@@ -359,6 +417,7 @@ async def scanner(app):
 
         await asyncio.sleep(CHECK_INTERVAL)
 
+
 async def startup(app):
     await app.bot.send_message(
         chat_id=CHANNEL_ID,
@@ -367,11 +426,13 @@ async def startup(app):
 
     asyncio.create_task(scanner(app))
 
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.post_init = startup
     logger.info("🚀 البوت شغّال!")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
