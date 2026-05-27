@@ -1,438 +1,646 @@
 import os
 import time
-import asyncio
-import logging
+import threading
+from datetime import datetime
+
+import ccxt
+import pandas as pd
 import requests
+from flask import Flask
 
-from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
-
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
-STOCH_MAX_K = float(os.getenv("STOCH_MAX_K", "30"))
-MIN_VOLUME_USDT = float(os.getenv("MIN_VOLUME_USDT", "50000"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.2"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
-
-REQUIRE_MACD_POSITIVE = os.getenv("REQUIRE_MACD_POSITIVE", "false").lower() == "true"
-
-EXCLUDE_KEYWORDS = os.getenv(
-    "EXCLUDE_KEYWORDS",
-    "USDC,USDT,FDUSD,TUSD,USDE,DAI,BUSD,USDP,USDD,BABAON,NVDAX,UP,DOWN,3L,3S,BULL,BEAR"
-).split(",")
-
-sent_alerts = set()
-
-
-def interval_map(exchange):
-    if exchange == "gate":
-        return "4h"
-    if exchange == "mexc":
-        return "4h"
-    if exchange == "okx":
-        return "4H"
-    if exchange == "bybit":
-        return "240"
-    return "4h"
-
-
-def safe_get(url, params=None):
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def should_skip_pair(pair):
-    pair_upper = pair.upper()
-
-    for keyword in EXCLUDE_KEYWORDS:
-        keyword = keyword.strip().upper()
-        if keyword and keyword in pair_upper:
-            return True
-
-    return False
-
-
-def get_pairs_gate():
-    data = safe_get("https://api.gateio.ws/api/v4/spot/currency_pairs")
-    return [
-        x["id"] for x in data
-        if x.get("quote") == "USDT"
-        and x.get("trade_status") == "tradable"
-        and not should_skip_pair(x["id"])
-    ]
-
-
-def get_pairs_mexc():
-    data = safe_get("https://api.mexc.com/api/v3/exchangeInfo")
-    return [
-        x["symbol"] for x in data.get("symbols", [])
-        if x.get("quoteAsset") == "USDT"
-        and x.get("status") == "ENABLED"
-        and not should_skip_pair(x["symbol"])
-    ]
-
-
-def get_pairs_okx():
-    data = safe_get(
-        "https://www.okx.com/api/v5/public/instruments",
-        {"instType": "SPOT"}
-    )
-    return [
-        x["instId"] for x in data.get("data", [])
-        if x.get("quoteCcy") == "USDT"
-        and x.get("state") == "live"
-        and not should_skip_pair(x["instId"])
-    ]
-
-
-def get_pairs_bybit():
-    data = safe_get(
-        "https://api.bybit.com/v5/market/instruments-info",
-        {"category": "spot", "limit": 1000}
-    )
-    return [
-        x["symbol"] for x in data.get("result", {}).get("list", [])
-        if x.get("quoteCoin") == "USDT"
-        and x.get("status") == "Trading"
-        and not should_skip_pair(x["symbol"])
-    ]
-
-
-def get_candles_gate(pair):
-    data = safe_get(
-        "https://api.gateio.ws/api/v4/spot/candlesticks",
-        {
-            "currency_pair": pair,
-            "interval": interval_map("gate"),
-            "limit": 100
-        }
-    )
-
-    candles = []
-
-    for c in data:
-        close = float(c[2])
-        base_vol = float(c[1])
-        candles.append({
-            "close": close,
-            "volume": base_vol * close
-        })
-
-    return candles
-
-
-def get_candles_mexc(pair):
-    data = safe_get(
-        "https://api.mexc.com/api/v3/klines",
-        {
-            "symbol": pair,
-            "interval": interval_map("mexc"),
-            "limit": 100
-        }
-    )
-
-    return [
-        {
-            "close": float(c[4]),
-            "volume": float(c[7])
-        }
-        for c in data
-    ]
 
+# =========================
+# FLASK FOR RAILWAY
+# =========================
+app = Flask(__name__)
 
-def get_candles_okx(pair):
-    data = safe_get(
-        "https://www.okx.com/api/v5/market/candles",
-        {
-            "instId": pair,
-            "bar": interval_map("okx"),
-            "limit": 100
-        }
-    )
+@app.route("/")
+def home():
+    return "CMC Multi-Exchange Stoch RSI + MACD Bot is running ✅"
 
-    candles = []
 
-    for c in data.get("data", []):
-        candles.append({
-            "close": float(c[4]),
-            "volume": float(c[7])
-        })
+# =========================
+# ENV HELPERS
+# =========================
+def env_str(name, default=""):
+    return os.getenv(name, default).strip()
 
-    return list(reversed(candles))
+def env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except:
+        return default
 
+def env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except:
+        return default
 
-def get_candles_bybit(pair):
-    data = safe_get(
-        "https://api.bybit.com/v5/market/kline",
-        {
-            "category": "spot",
-            "symbol": pair,
-            "interval": interval_map("bybit"),
-            "limit": 100
-        }
-    )
+def env_bool(name, default):
+    return os.getenv(name, str(default)).lower() == "true"
 
-    candles = []
 
-    for c in data.get("result", {}).get("list", []):
-        candles.append({
-            "close": float(c[4]),
-            "volume": float(c[6])
-        })
+# =========================
+# VARIABLES
+# =========================
+TELEGRAM_BOT_TOKEN = env_str("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHANNEL_ID = env_str("TELEGRAM_CHANNEL_ID")
 
-    return list(reversed(candles))
+CHECK_INTERVAL = env_int("CHECK_INTERVAL", 900)
+TIMEFRAMES = [x.strip() for x in env_str("TIMEFRAMES", "1h,4h,1d").split(",") if x.strip()]
 
+RSI_LENGTH = env_int("RSI_LENGTH", 14)
+STOCH_LENGTH = env_int("STOCH_LENGTH", 14)
+K_SMOOTH = env_int("K_SMOOTH", 3)
+D_SMOOTH = env_int("D_SMOOTH", 3)
 
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return []
+MACD_FAST = env_int("MACD_FAST", 12)
+MACD_SLOW = env_int("MACD_SLOW", 26)
+MACD_SIGNAL = env_int("MACD_SIGNAL", 9)
 
-    gains = []
-    losses = []
+MAX_STOCH_RSI = env_float("MAX_STOCH_RSI", 40)
 
-    for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
+REQUIRE_K_ABOVE_D = env_bool("REQUIRE_K_ABOVE_D", True)
+REQUIRE_MACD_POSITIVE = env_bool("REQUIRE_MACD_POSITIVE", True)
+REQUIRE_MACD_RISING = env_bool("REQUIRE_MACD_RISING", True)
+REQUIRE_MACD_JUST_TURNED_POSITIVE = env_bool("REQUIRE_MACD_JUST_TURNED_POSITIVE", False)
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+MIN_24H_VOLUME_USD = env_float("MIN_24H_VOLUME_USD", 50000)
+MIN_CANDLE_VOLUME_USD = env_float("MIN_CANDLE_VOLUME_USD", 200000)
+MIN_VOLUME_RATIO = env_float("MIN_VOLUME_RATIO", 2)
 
-    rsis = []
+VOLUME_LOOKBACK = env_int("VOLUME_LOOKBACK", 20)
 
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+SIGNAL_COOLDOWN_HOURS = env_float("SIGNAL_COOLDOWN_HOURS", 12)
 
-        if avg_loss == 0:
-            rsis.append(100)
-        else:
-            rs = avg_gain / avg_loss
-            rsis.append(100 - (100 / (1 + rs)))
+ENABLE_GATE = env_bool("ENABLE_GATE", True)
+ENABLE_KUCOIN = env_bool("ENABLE_KUCOIN", True)
+ENABLE_OKX = env_bool("ENABLE_OKX", True)
+ENABLE_BYBIT = env_bool("ENABLE_BYBIT", True)
+ENABLE_BITGET = env_bool("ENABLE_BITGET", True)
 
-    return rsis
+USE_CMC_FILTER = env_bool("USE_CMC_FILTER", True)
+CMC_API_KEY = env_str("CMC_API_KEY")
+CMC_TOP_N = env_int("CMC_TOP_N", 2000)
+MIN_MARKET_CAP = env_float("MIN_MARKET_CAP", 0)
+MAX_MARKET_CAP = env_float("MAX_MARKET_CAP", 1000000000)
 
+EXCLUDE_STABLES = env_bool("EXCLUDE_STABLES", True)
 
-def stoch_rsi(closes):
-    rsi_values = rsi(closes)
 
-    if len(rsi_values) < 20:
-        return None
+# =========================
+# GLOBALS
+# =========================
+last_alerts = {}
 
-    lowest = min(rsi_values[-14:])
-    highest = max(rsi_values[-14:])
 
-    if highest == lowest:
-        return None
+# =========================
+# TELEGRAM
+# =========================
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        print("Telegram variables missing")
+        return
 
-    current = rsi_values[-1]
-    k = ((current - lowest) / (highest - lowest)) * 100
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    d_values = []
-    for x in rsi_values[-3:]:
-        d_values.append(((x - lowest) / (highest - lowest)) * 100)
-
-    d = sum(d_values) / len(d_values)
-
-    return k, d
-
-
-def ema(values, period):
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-    ema_value = sum(values[:period]) / period
-
-    for price in values[period:]:
-        ema_value = (price - ema_value) * multiplier + ema_value
-
-    return ema_value
-
-
-def macd_histogram(closes):
-    if len(closes) < 35:
-        return 0
-
-    ema12 = ema(closes, 12)
-    ema26 = ema(closes, 26)
-
-    if ema12 is None or ema26 is None:
-        return 0
-
-    macd_line = ema12 - ema26
-
-    macd_values = []
-
-    for i in range(26, len(closes)):
-        part = closes[:i + 1]
-        e12 = ema(part, 12)
-        e26 = ema(part, 26)
-
-        if e12 is not None and e26 is not None:
-            macd_values.append(e12 - e26)
-
-    signal = ema(macd_values, 9)
-
-    if signal is None:
-        return 0
-
-    return macd_line - signal
-
-
-def volume_ratio(candles):
-    if len(candles) < 21:
-        return 0
-
-    current_volume = candles[-1]["volume"]
-    avg_volume = sum(x["volume"] for x in candles[-20:-1]) / 19
-
-    if avg_volume <= 0:
-        return 0
-
-    return current_volume / avg_volume
-
-
-def build_alert(exchange, pair, price, k, d, macd_hist, volume, vol_ratio, confidence):
-    return (
-        f"🟢 *Stoch RSI Alert*\n\n"
-        f"🏦 المنصة: *{exchange.upper()}*\n"
-        f"🪙 العملة: *{pair}*\n"
-        f"💰 السعر: `{price}`\n\n"
-        f"📊 Stoch RSI K: `{k:.2f}`\n"
-        f"📊 Stoch RSI D: `{d:.2f}`\n"
-        f"📈 MACD Histogram: `{macd_hist:.6f}`\n\n"
-        f"💧 Volume: `${volume:,.0f}`\n"
-        f"🔥 Volume Ratio: `{vol_ratio:.2f}X`\n"
-        f"⏰ الفريم: *4H*\n"
-        f"🎯 الثقة: *{confidence}%*\n\n"
-        f"✅ K أعلى من D\n"
-        f"✅ Stoch RSI أقل من {STOCH_MAX_K}\n"
-        f"✅ Volume قوي\n"
-        f"✅ Volume Ratio أعلى من {MIN_VOLUME_RATIO}X\n"
-        f"{'✅ MACD إيجابي' if macd_hist > 0 else '⚠️ MACD سلبي'}\n\n"
-        f"⚠️ تحليل فقط وليس نصيحة مالية"
-    )
-
-
-async def scanner(app):
-    await asyncio.sleep(5)
-
-    exchanges = {
-        "gate": (get_pairs_gate, get_candles_gate),
-        "mexc": (get_pairs_mexc, get_candles_mexc),
-        "okx": (get_pairs_okx, get_candles_okx),
-        "bybit": (get_pairs_bybit, get_candles_bybit),
+    payload = {
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
 
-    while True:
+    try:
+        requests.post(url, json=payload, timeout=20)
+    except Exception as e:
+        print("Telegram error:", e)
+
+
+# =========================
+# COINMARKETCAP
+# =========================
+STABLE_BASES = {
+    "USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDD",
+    "USDE", "SUSD", "PYUSD", "USD", "EUR", "TRY", "BRL"
+}
+
+def get_cmc_symbols():
+    if not USE_CMC_FILTER:
+        return set()
+
+    if not CMC_API_KEY:
+        print("CMC_API_KEY missing")
+        return set()
+
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+
+    headers = {
+        "X-CMC_PRO_API_KEY": CMC_API_KEY
+    }
+
+    params = {
+        "start": 1,
+        "limit": min(CMC_TOP_N, 5000),
+        "convert": "USD",
+        "sort": "market_cap"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response.raise_for_status()
+
+        data = response.json().get("data", [])
+        symbols = set()
+
+        for coin in data:
+            symbol = coin.get("symbol", "").upper()
+            quote = coin.get("quote", {}).get("USD", {})
+            market_cap = quote.get("market_cap") or 0
+
+            if not symbol:
+                continue
+
+            if EXCLUDE_STABLES and symbol in STABLE_BASES:
+                continue
+
+            if market_cap < MIN_MARKET_CAP:
+                continue
+
+            if MAX_MARKET_CAP > 0 and market_cap > MAX_MARKET_CAP:
+                continue
+
+            symbols.add(symbol)
+
+        print(f"CMC symbols loaded: {len(symbols)}")
+        return symbols
+
+    except Exception as e:
+        print("CMC error:", e)
+        return set()
+
+
+# =========================
+# INDICATORS
+# =========================
+def rma(series, length):
+    return series.ewm(alpha=1 / length, adjust=False).mean()
+
+def calculate_rsi(close, length):
+    delta = close.diff()
+
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = rma(gain, length)
+    avg_loss = rma(loss, length)
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
+
+def calculate_stoch_rsi(df):
+    rsi = calculate_rsi(df["close"], RSI_LENGTH)
+
+    lowest_rsi = rsi.rolling(STOCH_LENGTH).min()
+    highest_rsi = rsi.rolling(STOCH_LENGTH).max()
+
+    stoch = 100 * (rsi - lowest_rsi) / (highest_rsi - lowest_rsi)
+
+    k = stoch.rolling(K_SMOOTH).mean()
+    d = k.rolling(D_SMOOTH).mean()
+
+    df["rsi"] = rsi
+    df["stoch_k"] = k
+    df["stoch_d"] = d
+
+    return df
+
+def calculate_macd(df):
+    close = df["close"]
+
+    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
+
+    macd = ema_fast - ema_slow
+    signal = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    hist = macd - signal
+
+    df["macd"] = macd
+    df["macd_signal"] = signal
+    df["macd_hist"] = hist
+
+    return df
+
+
+# =========================
+# EXCHANGES
+# =========================
+def get_exchanges():
+    exchanges = []
+
+    if ENABLE_GATE:
+        exchanges.append(("Gate", ccxt.gateio({"enableRateLimit": True})))
+
+    if ENABLE_KUCOIN:
+        exchanges.append(("KuCoin", ccxt.kucoin({"enableRateLimit": True})))
+
+    if ENABLE_OKX:
+        exchanges.append(("OKX", ccxt.okx({"enableRateLimit": True})))
+
+    if ENABLE_BYBIT:
+        exchanges.append(("Bybit", ccxt.bybit({"enableRateLimit": True})))
+
+    if ENABLE_BITGET:
+        exchanges.append(("Bitget", ccxt.bitget({"enableRateLimit": True})))
+
+    return exchanges
+
+
+BAD_KEYWORDS = [
+    "UP/", "DOWN/", "BULL/", "BEAR/",
+    "3L/", "3S/", "5L/", "5S/"
+]
+
+def is_valid_symbol(symbol, cmc_symbols):
+    if not symbol.endswith("/USDT"):
+        return False
+
+    if any(x in symbol for x in BAD_KEYWORDS):
+        return False
+
+    base = symbol.split("/")[0].upper()
+
+    if EXCLUDE_STABLES and base in STABLE_BASES:
+        return False
+
+    if USE_CMC_FILTER and cmc_symbols and base not in cmc_symbols:
+        return False
+
+    return True
+
+def get_symbols(exchange, cmc_symbols):
+    try:
+        markets = exchange.load_markets()
+        symbols = []
+
+        for symbol, market in markets.items():
+            if not market.get("active", True):
+                continue
+
+            if is_valid_symbol(symbol, cmc_symbols):
+                symbols.append(symbol)
+
+        return symbols
+
+    except Exception as e:
+        print("Load markets error:", e)
+        return []
+
+def fetch_ohlcv(exchange, symbol, timeframe):
+    try:
+        candles = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+
+        if not candles or len(candles) < 80:
+            return None
+
+        df = pd.DataFrame(
+            candles,
+            columns=["time", "open", "high", "low", "close", "volume"]
+        )
+
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        df["candle_volume_usd"] = df["close"] * df["volume"]
+
+        avg_volume = df["candle_volume_usd"].rolling(VOLUME_LOOKBACK).mean()
+        df["volume_ratio"] = df["candle_volume_usd"] / avg_volume
+
+        return df
+
+    except Exception:
+        return None
+
+def fetch_ticker(exchange, symbol):
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+
+        return {
+            "last": ticker.get("last") or 0,
+            "quoteVolume": ticker.get("quoteVolume") or 0,
+            "percentage": ticker.get("percentage") or 0
+        }
+
+    except:
+        return {
+            "last": 0,
+            "quoteVolume": 0,
+            "percentage": 0
+        }
+
+
+# =========================
+# SIGNAL LOGIC
+# =========================
+def check_signal(df):
+    df = calculate_stoch_rsi(df)
+    df = calculate_macd(df)
+
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    k = latest["stoch_k"]
+    d = latest["stoch_d"]
+
+    hist = latest["macd_hist"]
+    prev_hist = previous["macd_hist"]
+
+    candle_volume = latest["candle_volume_usd"]
+    volume_ratio = latest["volume_ratio"]
+
+    if pd.isna(k) or pd.isna(d) or pd.isna(hist) or pd.isna(prev_hist) or pd.isna(volume_ratio):
+        return False, {}
+
+    if k > MAX_STOCH_RSI:
+        return False, {}
+
+    if REQUIRE_K_ABOVE_D and not k > d:
+        return False, {}
+
+    if REQUIRE_MACD_POSITIVE and not hist > 0:
+        return False, {}
+
+    if REQUIRE_MACD_RISING and not hist > prev_hist:
+        return False, {}
+
+    if REQUIRE_MACD_JUST_TURNED_POSITIVE and not (prev_hist <= 0 and hist > 0):
+        return False, {}
+
+    if candle_volume < MIN_CANDLE_VOLUME_USD:
+        return False, {}
+
+    if volume_ratio < MIN_VOLUME_RATIO:
+        return False, {}
+
+    data = {
+        "k": float(k),
+        "d": float(d),
+        "macd_hist": float(hist),
+        "prev_macd_hist": float(prev_hist),
+        "candle_volume": float(candle_volume),
+        "volume_ratio": float(volume_ratio),
+        "close": float(latest["close"])
+    }
+
+    return True, data
+
+
+def can_alert(exchange_name, symbol):
+    key = f"{exchange_name}:{symbol}"
+    now = time.time()
+
+    last_time = last_alerts.get(key)
+
+    if last_time is None:
+        return True
+
+    cooldown = SIGNAL_COOLDOWN_HOURS * 3600
+
+    return now - last_time >= cooldown
+
+def mark_alert(exchange_name, symbol):
+    key = f"{exchange_name}:{symbol}"
+    last_alerts[key] = time.time()
+
+
+# =========================
+# FORMAT
+# =========================
+def format_money(value):
+    try:
+        value = float(value)
+
+        if value >= 1_000_000_000:
+            return f"${value / 1_000_000_000:.2f}B"
+
+        if value >= 1_000_000:
+            return f"${value / 1_000_000:.2f}M"
+
+        if value >= 1_000:
+            return f"${value / 1_000:.2f}K"
+
+        return f"${value:.2f}"
+
+    except:
+        return "$0"
+
+def build_alert_message(exchange_name, symbol, ticker, matched_frames):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    price = ticker.get("last") or matched_frames[0]["data"]["close"]
+    volume_24h = ticker.get("quoteVolume", 0)
+    change_24h = ticker.get("percentage", 0)
+
+    message = f"""
+🟢 <b>إشارة شراء | Stoch RSI + MACD</b>
+━━━━━━━━━━━━━━
+⏰ الوقت: <b>{now}</b>
+🏦 المنصة: <b>{exchange_name}</b>
+🪙 العملة: <b>{symbol}</b>
+💰 السعر: <b>{price}</b>
+
+📊 <b>الفريمات التي تحققت فيها الشروط:</b>
+"""
+
+    for item in matched_frames:
+        tf = item["timeframe"]
+        data = item["data"]
+
+        message += f"""
+━━━━━━━━━━━━━━
+⏱️ <b>الفريم: {tf}</b>
+
+📈 <b>Stoch RSI</b>
+K: <b>{data["k"]:.2f}</b>
+D: <b>{data["d"]:.2f}</b>
+
+📊 <b>MACD Histogram</b>
+الحالي: <b>{data["macd_hist"]:.8f}</b>
+السابق: <b>{data["prev_macd_hist"]:.8f}</b>
+الحالة: موجب ويتحسن ✅
+
+💧 <b>Volume</b>
+حجم الشمعة: <b>{format_money(data["candle_volume"])}</b>
+Volume Ratio: <b>{data["volume_ratio"]:.2f}x</b>
+"""
+
+    message += f"""
+━━━━━━━━━━━━━━
+📊 24H Volume: <b>{format_money(volume_24h)}</b>
+📈 تغير 24H: <b>{change_24h:.2f}%</b>
+
+✅ <b>الشروط:</b>
+• العملة مأخوذة من CoinMarketCap ✅
+• Stoch RSI أقل من {MAX_STOCH_RSI}
+• K أعلى من D: {"مطلوب ✅" if REQUIRE_K_ABOVE_D else "غير مطلوب"}
+• MACD موجب: {"مطلوب ✅" if REQUIRE_MACD_POSITIVE else "غير مطلوب"}
+• MACD متصاعد: {"مطلوب ✅" if REQUIRE_MACD_RISING else "غير مطلوب"}
+• Volume Ratio أعلى من {MIN_VOLUME_RATIO}x
+• حجم الشمعة أعلى من {format_money(MIN_CANDLE_VOLUME_USD)}
+
+⚠️ تحليل آلي فقط وليس توصية مالية.
+"""
+
+    return message.strip()
+
+
+# =========================
+# STARTUP MESSAGE
+# =========================
+def startup_message():
+    enabled_exchanges = []
+
+    if ENABLE_GATE:
+        enabled_exchanges.append("Gate")
+
+    if ENABLE_KUCOIN:
+        enabled_exchanges.append("KuCoin")
+
+    if ENABLE_OKX:
+        enabled_exchanges.append("OKX")
+
+    if ENABLE_BYBIT:
+        enabled_exchanges.append("Bybit")
+
+    if ENABLE_BITGET:
+        enabled_exchanges.append("Bitget")
+
+    exchanges_text = "\n".join([f"• {x}" for x in enabled_exchanges])
+
+    return f"""
+🤖 <b>بوت Stoch RSI + MACD اشتغل بنجاح ✅</b>
+━━━━━━━━━━━━━━
+📌 المصدر الأساسي للعملات:
+CoinMarketCap ✅
+
+🔎 طريقة العمل:
+CMC → فلترة Market Cap → البحث في المنصات → فحص 1h / 4h / 1d → إرسال التنبيه
+
+⏱️ الفريمات:
+<b>{", ".join(TIMEFRAMES)}</b>
+
+🔁 الفحص كل:
+<b>{CHECK_INTERVAL}</b> ثانية
+
+🏦 المنصات المفعلة:
+{exchanges_text}
+
+🌐 CoinMarketCap:
+• الحالة: {"مفعل ✅" if USE_CMC_FILTER else "غير مفعل"}
+• Top N: {CMC_TOP_N}
+• Min Market Cap: {format_money(MIN_MARKET_CAP)}
+• Max Market Cap: {format_money(MAX_MARKET_CAP)}
+
+📊 Stoch RSI:
+• RSI Length: {RSI_LENGTH}
+• Stoch Length: {STOCH_LENGTH}
+• K Smooth: {K_SMOOTH}
+• D Smooth: {D_SMOOTH}
+• Max Stoch RSI: {MAX_STOCH_RSI}
+
+📈 MACD:
+• Fast: {MACD_FAST}
+• Slow: {MACD_SLOW}
+• Signal: {MACD_SIGNAL}
+
+🎯 شروط الدخول:
+• K أعلى من D: {"مطلوب ✅" if REQUIRE_K_ABOVE_D else "غير مطلوب"}
+• MACD موجب: {"مطلوب ✅" if REQUIRE_MACD_POSITIVE else "غير مطلوب"}
+• MACD متصاعد: {"مطلوب ✅" if REQUIRE_MACD_RISING else "غير مطلوب"}
+• MACD تحول من سلبي إلى موجب: {"مطلوب ✅" if REQUIRE_MACD_JUST_TURNED_POSITIVE else "غير مطلوب"}
+• Volume Ratio أعلى من: {MIN_VOLUME_RATIO}x
+• حجم الشمعة أقل شيء: {format_money(MIN_CANDLE_VOLUME_USD)}
+• 24H Volume أقل شيء: {format_money(MIN_24H_VOLUME_USD)}
+
+✅ سيتم إرسال تنبيه عند تحقق الشروط في أي فريم.
+""".strip()
+
+
+# =========================
+# SCANNER
+# =========================
+def scan_exchange(exchange_name, exchange, cmc_symbols):
+    print(f"Scanning {exchange_name}...")
+
+    symbols = get_symbols(exchange, cmc_symbols)
+
+    print(f"{exchange_name} valid symbols: {len(symbols)}")
+
+    for symbol in symbols:
         try:
-            logger.info("🔍 Scanning 4H Stoch RSI...")
+            ticker = fetch_ticker(exchange, symbol)
 
-            for exchange, funcs in exchanges.items():
-                get_pairs, get_candles = funcs
-                pairs = get_pairs()
+            if ticker["quoteVolume"] < MIN_24H_VOLUME_USD:
+                continue
 
-                logger.info(f"{exchange}: {len(pairs)} pairs")
+            matched_frames = []
 
-                for pair in pairs:
-                    try:
-                        candles = get_candles(pair)
+            for timeframe in TIMEFRAMES:
+                df = fetch_ohlcv(exchange, symbol, timeframe)
 
-                        if len(candles) < 50:
-                            continue
+                if df is None:
+                    continue
 
-                        closes = [x["close"] for x in candles]
-                        result = stoch_rsi(closes)
+                is_signal, data = check_signal(df)
 
-                        if not result:
-                            continue
+                if is_signal:
+                    matched_frames.append({
+                        "timeframe": timeframe,
+                        "data": data
+                    })
 
-                        k, d = result
-                        last = candles[-1]
+            if matched_frames and can_alert(exchange_name, symbol):
+                message = build_alert_message(
+                    exchange_name,
+                    symbol,
+                    ticker,
+                    matched_frames
+                )
 
-                        price = last["close"]
-                        volume = last["volume"]
-                        vol_ratio = volume_ratio(candles)
-                        macd_hist = macd_histogram(closes)
+                send_telegram(message)
+                mark_alert(exchange_name, symbol)
 
-                        confidence = 0
+                print(f"Alert sent: {exchange_name} {symbol}")
 
-                        if k > d:
-                            confidence += 35
-
-                        if k <= STOCH_MAX_K:
-                            confidence += 25
-
-                        if volume >= MIN_VOLUME_USDT:
-                            confidence += 20
-
-                        if vol_ratio >= MIN_VOLUME_RATIO:
-                            confidence += 20
-
-                        if (
-                            k > d
-                            and k <= STOCH_MAX_K
-                            and volume >= MIN_VOLUME_USDT
-                            and vol_ratio >= MIN_VOLUME_RATIO
-                            and confidence >= MIN_CONFIDENCE
-                            and (not REQUIRE_MACD_POSITIVE or macd_hist > 0)
-                        ):
-                            key = f"{exchange}_{pair}_{int(time.time() // 14400)}"
-
-                            if key in sent_alerts:
-                                continue
-
-                            sent_alerts.add(key)
-
-                            await app.bot.send_message(
-                                chat_id=CHANNEL_ID,
-                                text=build_alert(
-                                    exchange,
-                                    pair,
-                                    price,
-                                    k,
-                                    d,
-                                    macd_hist,
-                                    volume,
-                                    vol_ratio,
-                                    confidence
-                                ),
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-
-                            await asyncio.sleep(1)
-
-                    except Exception as e:
-                        logger.warning(f"{exchange} {pair} error: {e}")
+            time.sleep(0.25)
 
         except Exception as e:
-            logger.error(f"Scanner Error: {e}")
-
-        await asyncio.sleep(CHECK_INTERVAL)
+            print(f"Error scanning {exchange_name} {symbol}:", e)
 
 
-async def startup(app):
-    await app.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text="🚀 البوت شغّال — Stoch RSI 4H"
-    )
+def scanner_loop():
+    send_telegram(startup_message())
 
-    asyncio.create_task(scanner(app))
+    while True:
+        cmc_symbols = get_cmc_symbols()
+
+        exchanges = get_exchanges()
+
+        for exchange_name, exchange in exchanges:
+            scan_exchange(exchange_name, exchange, cmc_symbols)
+
+        print(f"Sleeping {CHECK_INTERVAL} seconds...")
+        time.sleep(CHECK_INTERVAL)
 
 
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.post_init = startup
-    logger.info("🚀 البوت شغّال!")
-    app.run_polling()
-
-
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
-    main()
+    thread = threading.Thread(target=scanner_loop)
+    thread.daemon = True
+    thread.start()
+
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
