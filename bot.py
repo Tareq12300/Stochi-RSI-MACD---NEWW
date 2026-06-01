@@ -88,11 +88,19 @@ MAX_MARKET_CAP = env_float("MAX_MARKET_CAP", 1000000000)
 
 EXCLUDE_STABLES = env_bool("EXCLUDE_STABLES", True)
 
+ENABLE_TARGET_ALERTS = env_bool("ENABLE_TARGET_ALERTS", True)
+TP1_PERCENT = env_float("TP1_PERCENT", 3)
+TP2_PERCENT = env_float("TP2_PERCENT", 6)
+TP3_PERCENT = env_float("TP3_PERCENT", 10)
+SL_PERCENT = env_float("SL_PERCENT", 6)
+
 
 # =========================
 # GLOBALS
 # =========================
 last_alerts = {}
+active_trades = {}
+hit_targets = {}
 
 
 # =========================
@@ -415,6 +423,123 @@ def mark_alert(exchange_name, symbol):
 
 
 # =========================
+# TARGET ALERTS
+# =========================
+def register_trade(exchange_name, symbol, entry_price):
+    if not ENABLE_TARGET_ALERTS:
+        return
+
+    if not entry_price or entry_price <= 0:
+        return
+
+    key = f"{exchange_name}:{symbol}"
+
+    active_trades[key] = {
+        "exchange": exchange_name,
+        "symbol": symbol,
+        "entry": float(entry_price),
+        "tp1": float(entry_price) * (1 + TP1_PERCENT / 100),
+        "tp2": float(entry_price) * (1 + TP2_PERCENT / 100),
+        "tp3": float(entry_price) * (1 + TP3_PERCENT / 100),
+        "sl": float(entry_price) * (1 - SL_PERCENT / 100),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+
+    hit_targets[key] = set()
+
+    print(f"Trade registered: {key} entry={entry_price}")
+
+
+def check_targets(exchange_name, exchange):
+    if not ENABLE_TARGET_ALERTS:
+        return
+
+    for key, trade in list(active_trades.items()):
+        if trade["exchange"] != exchange_name:
+            continue
+
+        symbol = trade["symbol"]
+
+        try:
+            ticker = fetch_ticker(exchange, symbol)
+            price = ticker.get("last") or 0
+
+            if price <= 0:
+                continue
+
+            targets = [
+                ("TP1", trade["tp1"], TP1_PERCENT),
+                ("TP2", trade["tp2"], TP2_PERCENT),
+                ("TP3", trade["tp3"], TP3_PERCENT),
+            ]
+
+            for target_name, target_price, percent in targets:
+                if target_name not in hit_targets.get(key, set()) and price >= target_price:
+                    hit_targets[key].add(target_name)
+
+                    send_telegram(f"""
+🎯 <b>تم تحقيق الهدف {target_name}</b>
+━━━━━━━━━━━━━━
+🏦 المنصة: <b>{exchange_name}</b>
+🪙 العملة: <b>{symbol}</b>
+💰 سعر الدخول: <b>{trade["entry"]}</b>
+🚀 السعر الحالي: <b>{price}</b>
+🎯 سعر الهدف: <b>{target_price:.8f}</b>
+📈 نسبة الهدف: <b>+{percent}%</b>
+
+✅ تم إرسال هذا التنبيه مرة واحدة فقط لهذا الهدف.
+""".strip())
+
+                    print(f"Target hit: {key} {target_name}")
+
+            if "SL" not in hit_targets.get(key, set()) and price <= trade["sl"]:
+                hit_targets[key].add("SL")
+
+                send_telegram(f"""
+🔴 <b>تم ضرب وقف الخسارة</b>
+━━━━━━━━━━━━━━
+🏦 المنصة: <b>{exchange_name}</b>
+🪙 العملة: <b>{symbol}</b>
+💰 سعر الدخول: <b>{trade["entry"]}</b>
+📉 السعر الحالي: <b>{price}</b>
+🛑 وقف الخسارة: <b>{trade["sl"]:.8f}</b>
+📉 النسبة: <b>-{SL_PERCENT}%</b>
+""".strip())
+
+                active_trades.pop(key, None)
+                hit_targets.pop(key, None)
+
+                print(f"Stop loss hit: {key}")
+                continue
+
+            if key in hit_targets and {"TP1", "TP2", "TP3"}.issubset(hit_targets[key]):
+                send_telegram(f"""
+✅ <b>تم تحقيق جميع الأهداف</b>
+━━━━━━━━━━━━━━
+🏦 المنصة: <b>{exchange_name}</b>
+🪙 العملة: <b>{symbol}</b>
+💰 سعر الدخول: <b>{trade["entry"]}</b>
+🚀 السعر الحالي: <b>{price}</b>
+
+🎯 TP1 ✅
+🎯 TP2 ✅
+🎯 TP3 ✅
+
+تم إغلاق متابعة الصفقة آلياً.
+""".strip())
+
+                active_trades.pop(key, None)
+                hit_targets.pop(key, None)
+
+                print(f"All targets completed: {key}")
+
+            time.sleep(0.10)
+
+        except Exception as e:
+            print(f"Target check error {exchange_name} {symbol}:", e)
+
+
+# =========================
 # FORMAT
 # =========================
 def format_money(value):
@@ -442,6 +567,11 @@ def build_alert_message(exchange_name, symbol, ticker, matched_frames):
     volume_24h = ticker.get("quoteVolume", 0)
     change_24h = ticker.get("percentage", 0)
 
+    tp1 = price * (1 + TP1_PERCENT / 100)
+    tp2 = price * (1 + TP2_PERCENT / 100)
+    tp3 = price * (1 + TP3_PERCENT / 100)
+    sl = price * (1 - SL_PERCENT / 100)
+
     message = f"""
 🟢 <b>إشارة شراء | Stoch RSI + MACD</b>
 ━━━━━━━━━━━━━━
@@ -449,6 +579,12 @@ def build_alert_message(exchange_name, symbol, ticker, matched_frames):
 🏦 المنصة: <b>{exchange_name}</b>
 🪙 العملة: <b>{symbol}</b>
 💰 السعر: <b>{price}</b>
+
+🎯 <b>الأهداف</b>
+TP1 +{TP1_PERCENT}%: <b>{tp1:.8f}</b>
+TP2 +{TP2_PERCENT}%: <b>{tp2:.8f}</b>
+TP3 +{TP3_PERCENT}%: <b>{tp3:.8f}</b>
+🛑 SL -{SL_PERCENT}%: <b>{sl:.8f}</b>
 
 📊 <b>الفريمات التي تحققت فيها الشروط:</b>
 """
@@ -489,6 +625,7 @@ Volume Ratio: <b>{data["volume_ratio"]:.2f}x</b>
 • Volume Ratio أعلى من {MIN_VOLUME_RATIO}x
 • حجم الشمعة أعلى من {format_money(MIN_CANDLE_VOLUME_USD)}
 
+🔔 سيتم إرسال تنبيه منفصل عند تحقيق كل هدف.
 ⚠️ تحليل آلي فقط وليس توصية مالية.
 """
 
@@ -563,6 +700,13 @@ CMC → فلترة Market Cap → البحث في المنصات → فحص 1h /
 • حجم الشمعة أقل شيء: {format_money(MIN_CANDLE_VOLUME_USD)}
 • 24H Volume أقل شيء: {format_money(MIN_24H_VOLUME_USD)}
 
+🎯 تنبيهات الأهداف:
+• الحالة: {"مفعلة ✅" if ENABLE_TARGET_ALERTS else "غير مفعلة"}
+• TP1: +{TP1_PERCENT}%
+• TP2: +{TP2_PERCENT}%
+• TP3: +{TP3_PERCENT}%
+• SL: -{SL_PERCENT}%
+
 ✅ سيتم إرسال تنبيه عند تحقق الشروط في أي فريم.
 """.strip()
 
@@ -611,6 +755,9 @@ def scan_exchange(exchange_name, exchange, cmc_symbols):
                 send_telegram(message)
                 mark_alert(exchange_name, symbol)
 
+                entry_price = ticker.get("last") or matched_frames[0]["data"]["close"]
+                register_trade(exchange_name, symbol, entry_price)
+
                 print(f"Alert sent: {exchange_name} {symbol}")
 
             time.sleep(0.25)
@@ -628,6 +775,7 @@ def scanner_loop():
         exchanges = get_exchanges()
 
         for exchange_name, exchange in exchanges:
+            check_targets(exchange_name, exchange)
             scan_exchange(exchange_name, exchange, cmc_symbols)
 
         print(f"Sleeping {CHECK_INTERVAL} seconds...")
