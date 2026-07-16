@@ -27,11 +27,18 @@ RSI_TIMEFRAME = os.environ.get("RSI_TIMEFRAME", "240")
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
 MAX_RSI_BUY = float(os.environ.get("MAX_RSI_BUY", "20"))
 
-# إعدادات التنبيه المبكر
+# إعدادات نظام التنبيه المزدوج
+ENABLE_EARLY_ALERTS = os.environ.get("ENABLE_EARLY_ALERTS", "true").lower() == "true"
+ENABLE_CONFIRMED_SIGNALS = os.environ.get("ENABLE_CONFIRMED_SIGNALS", "true").lower() == "true"
 ALLOW_EARLY_STOCH = os.environ.get("ALLOW_EARLY_STOCH", "true").lower() == "true"
 MAX_STOCH_GAP = float(os.environ.get("MAX_STOCH_GAP", "8"))
+REQUIRE_STOCH_RISING = os.environ.get("REQUIRE_STOCH_RISING", "true").lower() == "true"
 ALLOW_NEGATIVE_MACD = os.environ.get("ALLOW_NEGATIVE_MACD", "true").lower() == "true"
 REQUIRE_MACD_RISING = os.environ.get("REQUIRE_MACD_RISING", "true").lower() == "true"
+REQUIRE_CONFIRMED_MACD_POSITIVE = os.environ.get("REQUIRE_CONFIRMED_MACD_POSITIVE", "true").lower() == "true"
+EARLY_ALERT_COOLDOWN_HOURS = float(os.environ.get("EARLY_ALERT_COOLDOWN_HOURS", "4"))
+CONFIRMED_SIGNAL_COOLDOWN_HOURS = float(os.environ.get("CONFIRMED_SIGNAL_COOLDOWN_HOURS", "12"))
+ALERT_STATE_FILE = os.environ.get("ALERT_STATE_FILE", "alert_state.json")
 
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "90"))
 MAX_24H_CHANGE = float(os.environ.get("MAX_24H_CHANGE", "15"))
@@ -82,6 +89,56 @@ PRIVACY = {"ZEC", "DASH"}
 
 BLACKLIST = STABLECOINS | MEME | GAMING | GAMBLING | PREDICTION | PRIVACY
 
+
+
+def load_alert_state() -> dict:
+    try:
+        if not os.path.exists(ALERT_STATE_FILE):
+            return {}
+        with open(ALERT_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.error(f"load_alert_state error: {e}")
+        return {}
+
+
+def save_alert_state(state: dict):
+    try:
+        with open(ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"save_alert_state error: {e}")
+
+
+def alert_key(symbol: str, stage: str) -> str:
+    return f"{symbol.upper()}:{stage.upper()}"
+
+
+def alert_on_cooldown(symbol: str, stage: str) -> bool:
+    state = load_alert_state()
+    raw = state.get(alert_key(symbol, stage))
+    if not raw:
+        return False
+    try:
+        last_time = datetime.fromisoformat(raw)
+        if last_time.tzinfo is None:
+            last_time = SAUDI_TZ.localize(last_time)
+        hours = EARLY_ALERT_COOLDOWN_HOURS if stage == "EARLY" else CONFIRMED_SIGNAL_COOLDOWN_HOURS
+        elapsed = (datetime.now(SAUDI_TZ) - last_time.astimezone(SAUDI_TZ)).total_seconds() / 3600
+        return elapsed < hours
+    except Exception:
+        return False
+
+
+def mark_alert_sent(symbol: str, stage: str):
+    state = load_alert_state()
+    state[alert_key(symbol, stage)] = datetime.now(SAUDI_TZ).isoformat()
+    # منع تضخم الملف إلى ما لا نهاية
+    if len(state) > 5000:
+        items = sorted(state.items(), key=lambda item: item[1], reverse=True)[:3000]
+        state = dict(items)
+    save_alert_state(state)
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -1009,9 +1066,10 @@ def analyze_signal(data: dict):
     stoch_turning_up = stoch_k > stoch_k_prev
     stoch_gap = max(stoch_d - stoch_k, 0)
     early_stoch = (
-        ALLOW_EARLY_STOCH
+        ENABLE_EARLY_ALERTS
+        and ALLOW_EARLY_STOCH
         and not stoch_crossed
-        and stoch_turning_up
+        and (stoch_turning_up or not REQUIRE_STOCH_RISING)
         and stoch_gap <= MAX_STOCH_GAP
     )
 
@@ -1059,6 +1117,17 @@ def analyze_signal(data: dict):
             f"MACD ما زال سلبيًا لكنه يتحسن باتجاه الصفر: `{macd_hist_prev}` → `{macd_hist}`"
         )
         signal_stage = "EARLY"
+
+    # الإشارة المؤكدة تتطلب تقاطع Stoch RSI وMACD موجبًا عند تفعيل الشرط.
+    confirmed_ready = stoch_crossed and (
+        macd_hist > 0 or not REQUIRE_CONFIRMED_MACD_POSITIVE
+    )
+    signal_stage = "CONFIRMED" if confirmed_ready else "EARLY"
+
+    if signal_stage == "EARLY" and not ENABLE_EARLY_ALERTS:
+        return None
+    if signal_stage == "CONFIRMED" and not ENABLE_CONFIRMED_SIGNALS:
+        return None
 
     if volume_spike:
         score += 2
@@ -1213,8 +1282,10 @@ def format_signal_message(sig: dict) -> str:
     spike_text = "نعم 🔥" if sig.get("volume_spike") else "لا"
     dir_text = "⬆️ متصاعد" if sig.get("macd_direction") == "rising" else "⬇️ متراجع"
 
+    stage_icon = "🟡" if sig.get("signal_stage") == "EARLY" else "🟢"
+
     return (
-        f"🟢 *{sig.get('signal_label', 'إشارة شراء')} 4H | {sig['symbol']}/USDT*\n"
+        f"{stage_icon} *{sig.get('signal_label', 'إشارة شراء')} 4H | {sig['symbol']}/USDT*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏰ *الوقت:* `{ts}`\n"
         f"🏦 *المنصة:* `{sig.get('exchange', 'غير معروف')}`\n"
@@ -1340,6 +1411,23 @@ def format_daily_summary() -> str:
     return "\n".join(lines)
 
 
+async def send_early_alert(bot: Bot, sig: dict):
+    """يرسل التنبيه المبكر فقط، دون تسجيله كصفقة نشطة أو احتساب أهدافه."""
+    try:
+        await bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            text=format_signal_message(sig),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        mark_alert_sent(sig["symbol"], "EARLY")
+        print(
+            f"🟡 {sig['symbol']} EARLY | MACD {sig.get('macd_histogram')} | "
+            f"Stoch K/D {sig.get('stoch_k')}/{sig.get('stoch_d')} | ثقة {sig['confidence']}%"
+        )
+    except Exception as e:
+        logging.error(f"send_early_alert {sig['symbol']}: {e}")
+
+
 async def send_signal(bot: Bot, sig: dict):
     try:
         await bot.send_message(
@@ -1351,6 +1439,7 @@ async def send_signal(bot: Bot, sig: dict):
         register_active_signal(sig)
         save_new_signal_to_history(sig)
         db_save_signal(sig)
+        mark_alert_sent(sig["symbol"], "CONFIRMED")
         print(
             f"✅ {sig['symbol']} BUY | MACD {sig.get('macd_strength')} {sig.get('macd_direction')} | "
             f"StochK {sig.get('stoch_k')} | Volume {format_big_number(sig.get('current_volume_usd', 0))}$ | "
@@ -1488,16 +1577,23 @@ async def run_bot():
             coin["volume_ratio"] = volume_data["ratio"]
             coin["current_volume_usd"] = volume_data.get("current_volume_usd", 0)
 
-            if coin["symbol"] in active_signals:
-                await asyncio.sleep(0.2)
-                continue
-
             sig = analyze_signal(coin)
 
             if sig:
-                await send_signal(bot, sig)
-                signals_this_round += 1
-                await asyncio.sleep(1.5)
+                stage = sig.get("signal_stage", "CONFIRMED")
+
+                if stage == "EARLY":
+                    # لا نرسل تنبيهًا مبكرًا إذا كانت هناك صفقة مؤكدة نشطة بالفعل.
+                    if coin["symbol"] not in active_signals and not alert_on_cooldown(coin["symbol"], "EARLY"):
+                        await send_early_alert(bot, sig)
+                        signals_this_round += 1
+                        await asyncio.sleep(1.5)
+                else:
+                    # يسمح بإرسال التأكيد بعد التنبيه المبكر، لكنه يمنع تكرار التأكيد.
+                    if coin["symbol"] not in active_signals and not alert_on_cooldown(coin["symbol"], "CONFIRMED"):
+                        await send_signal(bot, sig)
+                        signals_this_round += 1
+                        await asyncio.sleep(1.5)
 
             await asyncio.sleep(0.2)
 
