@@ -45,11 +45,9 @@ MAX_24H_CHANGE = float(os.environ.get("MAX_24H_CHANGE", "15"))
 MIN_VOLUME_24H = float(os.environ.get("MIN_VOLUME_24H", "3000000"))
 MIN_CURRENT_CANDLE_VOLUME_USD = float(os.environ.get("MIN_CURRENT_CANDLE_VOLUME_USD", "200000"))
 
-# إعدادات معدل الفوليوم مقارنة بمتوسط الشموع السابقة
+# إعدادات معدل فوليوم الشمعة الحالية مقارنة بالشمعة السابقة
 REQUIRE_VOLUME_RATIO = os.environ.get("REQUIRE_VOLUME_RATIO", "true").lower() == "true"
-MIN_VOLUME_RATIO = float(os.environ.get("MIN_VOLUME_RATIO", "2.0"))
-VOLUME_AVERAGE_PERIOD = int(os.environ.get("VOLUME_AVERAGE_PERIOD", "100"))
-VOLUME_AVERAGE_METHOD = os.environ.get("VOLUME_AVERAGE_METHOD", "sma").strip().lower()
+MIN_VOLUME_RATIO = float(os.environ.get("MIN_VOLUME_RATIO", "1.0"))
 
 HISTORY_FILE = os.environ.get("HISTORY_FILE", "signals_history.json")
 DB_FILE = os.environ.get("DB_FILE", "signals_bot.db")
@@ -955,54 +953,35 @@ def calculate_macd(prices: list):
     }
 
 
-def detect_volume_spike(volumes: list, price: float) -> dict:
+def detect_volume_spike(volumes: list, closes: list) -> dict:
     """
-    يحسب معدل حجم الشمعة الحالية مقارنة بمتوسط عدد قابل للتعديل
-    من الشموع السابقة، بالإضافة إلى قيمة الفوليوم الحالية والمتوسطة بالدولار.
+    يحسب فوليوم الشمعة الحالية بالدولار مقارنة بفوليوم الشمعة السابقة،
+    مطابقًا لمعادلة مؤشر TradingView:
+    (volume * close) / (volume[1] * close[1])
     """
-    required_length = VOLUME_AVERAGE_PERIOD + 1
-
-    if VOLUME_AVERAGE_PERIOD <= 0 or len(volumes) < required_length:
+    if len(volumes) < 2 or len(closes) < 2:
         return {
             "spike": False,
             "ratio": 0.0,
             "current_volume_usd": 0.0,
-            "average_volume_usd": 0.0,
+            "previous_volume_usd": 0.0,
             "enough_data": False,
         }
 
-    current_volume = float(volumes[-1])
-    previous_volumes = [float(v) for v in volumes[-required_length:-1]]
+    current_volume_usd = float(volumes[-1]) * float(closes[-1])
+    previous_volume_usd = float(volumes[-2]) * float(closes[-2])
 
-    # TradingView Volume MA is normally a simple moving average (SMA).
-    # EMA remains available through VOLUME_AVERAGE_METHOD=ema.
-    if VOLUME_AVERAGE_METHOD == "ema":
-        alpha = 2 / (VOLUME_AVERAGE_PERIOD + 1)
-        average_volume = previous_volumes[0]
-        for volume in previous_volumes[1:]:
-            average_volume = (volume * alpha) + (average_volume * (1 - alpha))
-    else:
-        average_volume = sum(previous_volumes) / VOLUME_AVERAGE_PERIOD
-
-    current_volume_usd = current_volume * price
-    average_volume_usd = average_volume * price
-
-    if average_volume <= 0:
-        return {
-            "spike": False,
-            "ratio": 0.0,
-            "current_volume_usd": current_volume_usd,
-            "average_volume_usd": average_volume_usd,
-            "enough_data": True,
-        }
-
-    ratio = current_volume / average_volume
+    ratio = (
+        current_volume_usd / previous_volume_usd
+        if previous_volume_usd > 0
+        else 0.0
+    )
 
     return {
         "spike": ratio >= MIN_VOLUME_RATIO,
         "ratio": round(ratio, 2),
         "current_volume_usd": current_volume_usd,
-        "average_volume_usd": average_volume_usd,
+        "previous_volume_usd": previous_volume_usd,
         "enough_data": True,
     }
 
@@ -1075,7 +1054,7 @@ def analyze_signal(data: dict):
         return None
 
     # عند تفعيل الشرط، لا تُرسل الإشارة إلا إذا كان فوليوم الشمعة الحالية
-    # يساوي أو يتجاوز النسبة المطلوبة من متوسط الشموع السابقة.
+    # يساوي أو يتجاوز النسبة المطلوبة مقارنة بالشمعة السابقة.
     if REQUIRE_VOLUME_RATIO:
         if not volume_enough_data or volume_ratio < MIN_VOLUME_RATIO:
             return None
@@ -1168,7 +1147,7 @@ def analyze_signal(data: dict):
         reasons.append("Volume Spike قوي 🔥")
     else:
         reasons.append(
-            f"الفوليوم مستوفٍ للحد الأدنى دون Spike — `{data.get('volume_ratio', 1.0):.2f}x`"
+            f"فوليوم الشمعة الحالية مستوفٍ للحد الأدنى مقارنة بالسابقة — `{data.get('volume_ratio', 1.0):.2f}x`"
         )
 
     if -1.5 <= change_1h <= 2:
@@ -1278,7 +1257,7 @@ def analyze_signal(data: dict):
         "volume_24h": volume_24h,
         "volume_ratio": data.get("volume_ratio", 0.0),
         "current_volume_usd": data.get("current_volume_usd", 0),
-        "average_volume_usd": data.get("average_volume_usd", 0),
+        "previous_volume_usd": data.get("previous_volume_usd", 0),
         "learning_note": learning["note"],
         "learning_adjustment": learning["adjustment"],
         "reasons": reasons[:9],
@@ -1336,7 +1315,7 @@ def format_signal_message(sig: dict) -> str:
         f"💧 *حجم التداول:* `{format_big_number(sig['volume_24h'])} $`\n"
         f"📊 *معدل الفوليوم:* `{sig.get('volume_ratio', 0.0):.2f}x`\n"
         f"💧 *فوليوم الشمعة:* `{format_big_number(sig.get('current_volume_usd', 0))} $`\n"
-        f"📏 *متوسط آخر {VOLUME_AVERAGE_PERIOD} شمعة ({VOLUME_AVERAGE_METHOD.upper()}):* `{format_big_number(sig.get('average_volume_usd', 0))} $`\n"
+        f"⏮️ *فوليوم الشمعة السابقة:* `{format_big_number(sig.get('previous_volume_usd', 0))} $`\n"
         f"🎯 *الأهداف:*\n"
         f"   ├ TP1: `{fp(sig['target1'])} $` `(+2%)`\n"
         f"   ├ TP2: `{fp(sig['target2'])} $` `(+4%)`\n"
@@ -1600,7 +1579,7 @@ async def run_bot():
 
             rsi_value = calculate_stoch_rsi(closes, RSI_PERIOD)
             macd_data = calculate_macd(closes)
-            volume_data = detect_volume_spike(volumes, current_price)
+            volume_data = detect_volume_spike(volumes, closes)
             volume_spike = volume_data["spike"]
 
             if rsi_value is None:
@@ -1613,7 +1592,7 @@ async def run_bot():
             coin["volume_spike"] = volume_spike
             coin["volume_ratio"] = volume_data["ratio"]
             coin["current_volume_usd"] = volume_data.get("current_volume_usd", 0)
-            coin["average_volume_usd"] = volume_data.get("average_volume_usd", 0)
+            coin["previous_volume_usd"] = volume_data.get("previous_volume_usd", 0)
             coin["volume_enough_data"] = volume_data.get("enough_data", False)
 
             sig = analyze_signal(coin)
