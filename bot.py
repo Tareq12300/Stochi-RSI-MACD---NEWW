@@ -48,14 +48,14 @@ TIMEFRAME = os.environ.get("TIMEFRAME", "4h").strip().lower()
 EXCHANGES = [
     item.strip().lower()
     for item in os.environ.get(
-        "EXCHANGES", "gateio,kucoin,mexc"
+        "EXCHANGES", "gateio,kucoin,mexc,binance"
     ).split(",")
     if item.strip()
 ]
 EXCHANGE_PRIORITY = [
     item.strip().lower()
     for item in os.environ.get(
-        "EXCHANGE_PRIORITY", "gateio,kucoin,mexc"
+        "EXCHANGE_PRIORITY", "gateio,kucoin,mexc,binance"
     ).split(",")
     if item.strip()
 ]
@@ -243,6 +243,12 @@ MEXC_TIMEFRAMES = {
     "1h": "60m", "4h": "4h", "8h": "8h", "1d": "1d", "1w": "1W",
 }
 
+BINANCE_TIMEFRAMES = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
+    "30m": "30m", "1h": "1h", "2h": "2h", "4h": "4h",
+    "6h": "6h", "8h": "8h", "12h": "12h", "1d": "1d", "1w": "1w",
+}
+
 OKX_TIMEFRAMES = {
     "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
     "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H",
@@ -258,6 +264,7 @@ def normalize_exchange_name(name: str) -> str:
         "kucoin": "kucoin",
         "mexc": "mexc",
         "okx": "okx",
+        "binance": "binance",
     }
     return aliases.get(name.strip().lower(), name.strip().lower())
 
@@ -285,6 +292,7 @@ def exchange_timeframe(exchange: str) -> Optional[str]:
         "kucoin": KUCOIN_TIMEFRAMES,
         "mexc": MEXC_TIMEFRAMES,
         "okx": OKX_TIMEFRAMES,
+        "binance": BINANCE_TIMEFRAMES,
     }
     return maps.get(exchange, {}).get(TIMEFRAME)
 
@@ -296,12 +304,14 @@ def exchange_timeframe(exchange: str) -> Optional[str]:
 KUCOIN_KLINE_URL = "https://api.kucoin.com/api/v1/market/candles"
 MEXC_KLINE_URL = "https://api.mexc.com/api/v3/klines"
 OKX_KLINE_URL = "https://www.okx.com/api/v5/market/candles"
+BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines"
 GATE_KLINE_URL = "https://api.gateio.ws/api/v4/spot/candlesticks"
 
 GATE_TICKERS_URL = "https://api.gateio.ws/api/v4/spot/tickers"
 KUCOIN_TICKERS_URL = "https://api.kucoin.com/api/v1/market/allTickers"
 MEXC_TICKERS_URL = "https://api.mexc.com/api/v3/ticker/24hr"
 OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
+BINANCE_TICKERS_URL = "https://api.binance.com/api/v3/ticker/24hr"
 
 
 # =========================================================
@@ -1167,6 +1177,44 @@ def get_mexc_markets() -> list:
         return []
 
 
+def get_binance_markets() -> list:
+    try:
+        rows = request_json(BINANCE_TICKERS_URL)
+        markets = []
+
+        for item in rows:
+            pair = item.get("symbol", "")
+
+            if not pair.endswith("USDT") or len(pair) <= 4:
+                continue
+
+            symbol = pair[:-4].upper()
+
+            if not valid_usdt_symbol(symbol):
+                continue
+
+            last = safe_float(item.get("lastPrice"))
+            volume_24h = safe_float(item.get("quoteVolume"))
+            change_24h = safe_float(item.get("priceChangePercent"))
+
+            if last <= 0 or volume_24h <= 0:
+                continue
+
+            markets.append({
+                "symbol": symbol,
+                "exchange": "Binance",
+                "price": last,
+                "exchange_volume_24h": volume_24h,
+                "exchange_change_24h": change_24h,
+            })
+
+        return markets
+
+    except Exception as exc:
+        logging.error("Binance tickers: %s", exc)
+        return []
+
+
 def get_okx_markets() -> list:
     try:
         payload = request_json(
@@ -1225,6 +1273,7 @@ def build_exchange_symbol_maps() -> Dict[str, Dict[str, dict]]:
         "kucoin": ("KuCoin", get_kucoin_markets),
         "mexc": ("MEXC", get_mexc_markets),
         "okx": ("OKX", get_okx_markets),
+        "binance": ("Binance", get_binance_markets),
     }
 
     sources = {}
@@ -1474,7 +1523,7 @@ def get_mexc_market_data(
             MEXC_KLINE_URL,
             params={
                 "symbol": f"{symbol}USDT",
-                "interval": exchange_timeframe("gateio"),
+                "interval": exchange_timeframe("mexc"),
                 "limit": CANDLE_LIMIT,
             },
             timeout=15,
@@ -1516,6 +1565,41 @@ def get_mexc_market_data(
             symbol,
             exc,
         )
+        return None
+
+
+def get_binance_market_data(
+    symbol: str,
+) -> Optional[dict]:
+    try:
+        rows = request_json(
+            BINANCE_KLINE_URL,
+            params={
+                "symbol": f"{symbol}USDT",
+                "interval": exchange_timeframe("binance"),
+                "limit": min(CANDLE_LIMIT, 1000),
+            },
+            timeout=15,
+        )
+
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        closes = [safe_float(row[4]) for row in rows]
+        base_volumes = [safe_float(row[5]) for row in rows]
+        quote_volumes = [
+            safe_float(row[7]) if len(row) > 7 else base * close
+            for row, base, close in zip(rows, base_volumes, closes)
+        ]
+
+        return {
+            "closes": closes,
+            "base_volumes": base_volumes,
+            "quote_volumes": quote_volumes,
+        }
+
+    except Exception as exc:
+        logging.info("Binance candles %s: %s", symbol, exc)
         return None
 
 
@@ -1588,6 +1672,7 @@ def get_market_data_for_exchange(
         "KuCoin": "kucoin",
         "MEXC": "mexc",
         "OKX": "okx",
+        "Binance": "binance",
     }.get(exchange)
 
     if not exchange_key or exchange_timeframe(exchange_key) is None:
@@ -1604,6 +1689,9 @@ def get_market_data_for_exchange(
 
     if exchange == "OKX":
         return get_okx_market_data(symbol)
+
+    if exchange == "Binance":
+        return get_binance_market_data(symbol)
 
     return None
 
